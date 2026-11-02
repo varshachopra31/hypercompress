@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v8"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v9"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -227,8 +227,11 @@ function runCompression(target, meta){
     showResult(res.blob, res);
   }).catch(function(err){
     setBusy(false);
-    toast("Compression failed: " + err.message, "err");
-    setProgress(0, "Failed");
+    console.error("HyperCompress failed:", err);
+    var why = (err && (err.message || err.name)) || String(err);
+    if(/memory|allocation|array buffer/i.test(why)) why += " — the browser ran out of memory. Close other tabs and try again, or split the PDF into parts.";
+    toast("Compression failed: " + why, "err");
+    setProgress(0, "Failed — " + why);
   });
 }
 
@@ -400,6 +403,7 @@ async function estimateTotal(level, samples){
   for(var k = 0; k < samples.length; k++){
     var page = await state.pdf.getPage(samples[k]);
     sum += (await encodePage(page, s)).bytes;
+    page.cleanup();
   }
   var avg = sum / samples.length;
   // Image payload dominates; add ~3% PDF structural overhead + a small base.
@@ -441,21 +445,42 @@ async function compressToTarget(target){
   var pdf = state.pdf;
   var totalPages = pdf.numPages;
   var outDoc = await PDFLib.PDFDocument.create();
+  var srcDoc = null, copied = 0;
 
   for(var i = 1; i <= totalPages; i++){
     setProgress(35 + (i - 1) / totalPages * 60, "Compressing page " + i + " of " + totalPages + "...");
-    var page = await pdf.getPage(i);
-    var enc = await encodePage(page, s);
-    var origVP = page.getViewport({ scale: 1 });
-    var outPage = outDoc.addPage([origVP.width, origVP.height]);
-    if(enc.kind === "bilevel"){
-      drawBilevel(outDoc, outPage, enc, origVP.width, origVP.height);
-    } else {
-      var img = await outDoc.embedJpg(enc.data);
-      outPage.drawImage(img, { x: 0, y: 0, width: origVP.width, height: origVP.height });
+    var page = null;
+    try {
+      page = await pdf.getPage(i);
+      var enc = await encodePage(page, s);
+      var origVP = page.getViewport({ scale: 1 });
+      var outPage = outDoc.addPage([origVP.width, origVP.height]);
+      if(enc.kind === "bilevel"){
+        drawBilevel(outDoc, outPage, enc, origVP.width, origVP.height);
+      } else {
+        var img = await outDoc.embedJpg(enc.data);
+        outPage.drawImage(img, { x: 0, y: 0, width: origVP.width, height: origVP.height });
+      }
+    } catch(pageErr){
+      // One page the renderer can't handle must not sink a 700-page run:
+      // carry that page over from the original file untouched instead.
+      console.warn("HyperCompress: page " + i + " could not be re-encoded, copying the original", pageErr);
+      if(!srcDoc){
+        srcDoc = await PDFLib.PDFDocument.load(new Uint8Array(await state.file.arrayBuffer()), { ignoreEncryption: true, updateMetadata: false });
+      }
+      var cp = await outDoc.copyPages(srcDoc, [i - 1]);
+      outDoc.addPage(cp[0]);
+      copied++;
     }
+    // pdf.js caches every decoded image it has drawn (a scanned page's
+    // background alone is ~9 MB decoded). Across hundreds of pages that
+    // exhausts memory and the run dies with "Compression failed", so release
+    // each page's decoded resources as soon as it has been encoded.
+    if(page) page.cleanup();
+    if(i % 50 === 0){ try { await pdf.cleanup(); } catch(e){} }
     if(i % 5 === 0){ await new Promise(function(r){ setTimeout(r, 0); }); }
   }
+  if(copied) console.warn("HyperCompress: " + copied + " page(s) were copied from the original unchanged.");
 
   setProgress(97, "Assembling PDF...");
   var outBytes = await outDoc.save();
