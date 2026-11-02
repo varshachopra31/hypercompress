@@ -101,35 +101,21 @@ function wireUI(){
 // of the PDF's page geometry — a scanned PDF with a huge page box no longer
 // renders a giant image. LONG_MIN is tiny (aggressive) but still legible-ish;
 // LONG_MAX is crisp. Below READABLE_FLOOR_LEVEL the text starts to soften.
-var LONG_MIN = 150, LONG_MAX = 2100;
-var READ_PX = 1300;      // a crisp, comfortably readable resolution (~157 DPI on A4)
-var KNEE = 0.5;          // level above which we only trade JPEG quality, never pixels
-var Q_LOW = 0.14, Q_MAX = 0.92;
-var READABLE_FLOOR_LEVEL = 0.27; // ~760px long side — below this, text softens
+// Text pages are stored as 1-bit black & white (see encodePage), so the only
+// size lever for them is RESOLUTION — a 1-bit page is razor sharp at any size,
+// it just carries less detail as the pixel count drops. The level scalar maps
+// to the longest-side pixel size. Photographic pages fall back to JPEG, whose
+// quality is tied to the same level but never allowed to go destructive.
+var LONG_MIN = 450, LONG_MAX = 2400;
+var READABLE_PX = 1050;  // ~90 DPI on A4 — below this, small 1-bit text starts to break up
+var READABLE_FLOOR_LEVEL = (READABLE_PX - LONG_MIN) / (LONG_MAX - LONG_MIN);
 
-// RESOLUTION-FIRST mapping. For text, pixels matter far more than JPEG quality,
-// so from level 1 down to the KNEE we hold a readable resolution and shed bytes
-// purely by lowering JPEG quality (text stays crisp, just more artefacts).
-// Only below the KNEE — when quality is already at its floor — do we start
-// lowering resolution, which is when text begins to soften.
 function levelToSettings(level){
   level = Math.max(0, Math.min(1, level));
-  var longPx, quality;
-  if(level >= KNEE){
-    var t = (level - KNEE) / (1 - KNEE);                    // 0..1 across the quality phase
-    longPx = Math.round(READ_PX + t * (LONG_MAX - READ_PX)); // 1300 -> 2100
-    quality = Q_LOW + t * (Q_MAX - Q_LOW);                  // 0.14 -> 0.92
-  } else {
-    var t2 = level / KNEE;                                  // 0..1 across the resolution phase
-    longPx = Math.round(LONG_MIN + t2 * (READ_PX - LONG_MIN)); // 150 -> 1300
-    quality = Q_LOW;
-  }
   return {
-    longPx: longPx,
-    quality: quality,
-    // Grayscale when the user opts in, or automatically deep in the
-    // resolution phase, where it halves the size while text stays readable.
-    grayscale: !!state.allowGray || level < 0.35
+    longPx: Math.round(LONG_MIN + level * (LONG_MAX - LONG_MIN)),
+    quality: 0.45 + level * 0.45,   // photo pages only: 0.45 -> 0.90
+    grayscale: !!state.allowGray
   };
 }
 
@@ -250,41 +236,125 @@ function setProgress(pct, label){
   $("#progressLabel").textContent = label || (Math.round(pct) + "%");
 }
 
-// Contrast-stretch the canvas so near-white backgrounds go pure white and text
-// darkens — keeps text edges crisp at low resolution and lets JPEG compress the
-// flat background almost for free. Makes scanned text far more readable per byte.
-function enhanceForText(ctx, w, h){
-  try {
-    var img = ctx.getImageData(0, 0, w, h);
-    var d = img.data, lo = 48, hi = 208, range = hi - lo;
-    for(var i = 0; i < d.length; i += 4){
-      for(var c = 0; c < 3; c++){
-        var v = (d[i + c] - lo) / range * 255;
-        d[i + c] = v < 0 ? 0 : (v > 255 ? 255 : v);
-      }
-    }
-    ctx.putImageData(img, 0, 0);
-  } catch(e){ /* tainted canvas etc. — skip, not fatal */ }
+// ── Scanned-document encoder ─────────────────────────────────────────────────
+// JPEG is built for photographs; on text it wastes bytes on sharp edges and
+// produces blur or ringing. Scanned text is ~98% white with sharp ink, so each
+// text page is binarised to 1 bit (razor sharp at any resolution) and stored
+// losslessly with the browser's native deflate — the approach fax and
+// professional scan compressors use. Pages that are genuinely photographic are
+// detected and kept as JPEG at a sane quality.
+
+var HAS_DEFLATE = typeof CompressionStream !== "undefined";
+
+// zlib-format deflate — exactly what PDF's /FlateDecode expects.
+async function deflateBytes(u8){
+  var cs = new CompressionStream("deflate");
+  var w = cs.writable.getWriter();
+  w.write(u8); w.close();
+  return new Uint8Array(await new Response(cs.readable).arrayBuffer());
 }
 
-// Render one page to a JPEG byte array, with the longest side capped at
-// s.longPx pixels (never upscaling a small page by more than 2x).
-async function renderPageJpeg(page, s){
+// Otsu's method: the luminance threshold that best separates ink from paper.
+// Adapts per page, so grey or uneven scan backgrounds still binarise cleanly.
+function otsuThreshold(hist, total){
+  var sum = 0;
+  for(var i = 0; i < 256; i++) sum += i * hist[i];
+  // When ink and paper are cleanly separated the maximum is a plateau across
+  // the whole valley; take its MIDDLE, not its first point, so anti-aliased
+  // edge pixels split evenly and thin strokes keep their weight.
+  var sumB = 0, wB = 0, best = -1, first = 128, last = 128;
+  for(var t = 0; t < 256; t++){
+    wB += hist[t]; if(!wB) continue;
+    var wF = total - wB; if(!wF) break;
+    sumB += t * hist[t];
+    var mB = sumB / wB, mF = (sum - sumB) / wF;
+    var between = wB * wF * (mB - mF) * (mB - mF);
+    if(between > best){ best = between; first = last = t; }
+    else if(between === best){ last = t; }
+  }
+  return (first + last) >> 1;
+}
+
+// Render a page at the given long-side pixel size (never upscaling >2x).
+async function renderPage(page, longPx){
   var base = page.getViewport({ scale: 1 });
   var longPt = Math.max(base.width, base.height) || 1;
-  var scale = Math.min(s.longPx / longPt, 2);
+  var scale = Math.min(longPx / longPt, 2);
   var vp = page.getViewport({ scale: scale });
   var canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.round(vp.width));
   canvas.height = Math.max(1, Math.round(vp.height));
   var ctx = canvas.getContext("2d");
-  if(s.grayscale) ctx.filter = "grayscale(100%)";
   await page.render({ canvasContext: ctx, viewport: vp }).promise;
-  ctx.filter = "none";
-  enhanceForText(ctx, canvas.width, canvas.height);
-  var blob = await new Promise(function(res){ canvas.toBlob(function(b){ res(b); }, "image/jpeg", s.quality); });
-  canvas.width = 1; canvas.height = 1;
-  return new Uint8Array(await blob.arrayBuffer());
+  return { canvas: canvas, ctx: ctx, w: canvas.width, h: canvas.height };
+}
+
+// Encode one page: 1-bit deflate for text, JPEG for photographic pages.
+// Returns { kind, data, bytes, width?, height? }.
+async function encodePage(page, s){
+  var r = await renderPage(page, s.longPx);
+  var w = r.w, h = r.h, n = w * h;
+  var img = r.ctx.getImageData(0, 0, w, h), d = img.data;
+  var hist = new Uint32Array(256), lum = new Uint8Array(n);
+  for(var i = 0, p = 0; i < n; i++, p += 4){
+    var v = (d[p] * 77 + d[p + 1] * 151 + d[p + 2] * 28) >> 8;
+    lum[i] = v; hist[v]++;
+  }
+  var thr = otsuThreshold(hist, n);
+  // Text is bimodal (ink vs paper) so few pixels sit near the threshold; a
+  // photo has a continuous tone range with many pixels right at it.
+  var near = 0, ink = 0;
+  for(var q = Math.max(0, thr - 24); q <= Math.min(255, thr + 24); q++) near += hist[q];
+  for(var b = 0; b <= thr; b++) ink += hist[b];
+  // A photo has many pixels at the threshold. A page that would come out
+  // mostly black (heavy shading the threshold swallowed) must not be
+  // binarised either, or text inside shaded cells vanishes into solid blocks.
+  var isPhoto = (near / n) > 0.12 || (ink / n) > 0.25;
+
+  if(isPhoto || !HAS_DEFLATE){
+    if(s.grayscale){
+      for(var j = 0, pp = 0; j < n; j++, pp += 4){ d[pp] = d[pp + 1] = d[pp + 2] = lum[j]; }
+      r.ctx.putImageData(img, 0, 0);
+    }
+    var blob = await new Promise(function(res){ r.canvas.toBlob(function(b){ res(b); }, "image/jpeg", s.quality); });
+    r.canvas.width = 1; r.canvas.height = 1;
+    var jp = new Uint8Array(await blob.arrayBuffer());
+    return { kind: "jpeg", data: jp, bytes: jp.length };
+  }
+
+  // Pack to 1 bit per pixel, rows padded to a byte; 1 = white, 0 = ink.
+  var rowBytes = (w + 7) >> 3, packed = new Uint8Array(rowBytes * h);
+  for(var y = 0; y < h; y++){
+    var ro = y * rowBytes, lo = y * w;
+    for(var x = 0; x < w; x++){
+      if(lum[lo + x] > thr) packed[ro + (x >> 3)] |= (0x80 >> (x & 7));
+    }
+  }
+  r.canvas.width = 1; r.canvas.height = 1;
+  var def = await deflateBytes(packed);
+  return { kind: "bilevel", data: def, width: w, height: h, bytes: def.length };
+}
+
+// Place a 1-bit deflated bitmap on a pdf-lib page as a true 1-bpc image
+// XObject (pdf-lib's own embedPng would expand it to 8-bit RGB).
+function drawBilevel(doc, outPage, enc, w, h){
+  var N = PDFLib.PDFName, Num = PDFLib.PDFNumber;
+  var dict = doc.context.obj({});
+  dict.set(N.of("Type"), N.of("XObject"));
+  dict.set(N.of("Subtype"), N.of("Image"));
+  dict.set(N.of("Width"), Num.of(enc.width));
+  dict.set(N.of("Height"), Num.of(enc.height));
+  dict.set(N.of("ColorSpace"), N.of("DeviceGray"));
+  dict.set(N.of("BitsPerComponent"), Num.of(1));
+  dict.set(N.of("Filter"), N.of("FlateDecode"));
+  var ref = doc.context.register(PDFLib.PDFRawStream.of(dict, enc.data));
+  var name = outPage.node.newXObject("Im", ref);
+  outPage.pushOperators(
+    PDFLib.pushGraphicsState(),
+    PDFLib.concatTransformationMatrix(w, 0, 0, h, 0, 0),
+    PDFLib.drawObject(name),
+    PDFLib.popGraphicsState()
+  );
 }
 
 // Spread of sample pages used to estimate the whole-document size cheaply.
@@ -310,11 +380,10 @@ async function estimateTotal(level, samples){
   var sum = 0;
   for(var k = 0; k < samples.length; k++){
     var page = await state.pdf.getPage(samples[k]);
-    var jpeg = await renderPageJpeg(page, s);
-    sum += jpeg.length;
+    sum += (await encodePage(page, s)).bytes;
   }
   var avg = sum / samples.length;
-  // JPEG payload dominates; add ~3% PDF structural overhead + a small base.
+  // Image payload dominates; add ~3% PDF structural overhead + a small base.
   return Math.round(avg * state.pageCount * 1.03 + 1500 + state.pageCount * 40);
 }
 
@@ -357,12 +426,15 @@ async function compressToTarget(target){
   for(var i = 1; i <= totalPages; i++){
     setProgress(35 + (i - 1) / totalPages * 60, "Compressing page " + i + " of " + totalPages + "...");
     var page = await pdf.getPage(i);
-    var jpeg = await renderPageJpeg(page, s);
-    var img = await outDoc.embedJpg(jpeg);
+    var enc = await encodePage(page, s);
     var origVP = page.getViewport({ scale: 1 });
-    outDoc.addPage([origVP.width, origVP.height]).drawImage(img, {
-      x: 0, y: 0, width: origVP.width, height: origVP.height
-    });
+    var outPage = outDoc.addPage([origVP.width, origVP.height]);
+    if(enc.kind === "bilevel"){
+      drawBilevel(outDoc, outPage, enc, origVP.width, origVP.height);
+    } else {
+      var img = await outDoc.embedJpg(enc.data);
+      outPage.drawImage(img, { x: 0, y: 0, width: origVP.width, height: origVP.height });
+    }
     if(i % 5 === 0){ await new Promise(function(r){ setTimeout(r, 0); }); }
   }
 
@@ -513,6 +585,10 @@ function toast(msg, cls){
   clearTimeout(_toastTimer);
   _toastTimer = setTimeout(function(){ el.className = "toast"; }, 4000);
 }
+
+// Test hook (same convention as the other dashboards' window.__xbrl / __mca).
+window.__hc = { encodePage: encodePage, drawBilevel: drawBilevel, deflateBytes: deflateBytes,
+  otsuThreshold: otsuThreshold, levelToSettings: levelToSettings, state: state };
 
 if(document.readyState === "loading"){
   document.addEventListener("DOMContentLoaded", boot);
