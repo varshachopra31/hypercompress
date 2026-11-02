@@ -228,6 +228,23 @@ function setProgress(pct, label){
   $("#progressLabel").textContent = label || (Math.round(pct) + "%");
 }
 
+// Contrast-stretch the canvas so near-white backgrounds go pure white and text
+// darkens — keeps text edges crisp at low resolution and lets JPEG compress the
+// flat background almost for free. Makes scanned text far more readable per byte.
+function enhanceForText(ctx, w, h){
+  try {
+    var img = ctx.getImageData(0, 0, w, h);
+    var d = img.data, lo = 48, hi = 208, range = hi - lo;
+    for(var i = 0; i < d.length; i += 4){
+      for(var c = 0; c < 3; c++){
+        var v = (d[i + c] - lo) / range * 255;
+        d[i + c] = v < 0 ? 0 : (v > 255 ? 255 : v);
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  } catch(e){ /* tainted canvas etc. — skip, not fatal */ }
+}
+
 // Render one page to a JPEG byte array, with the longest side capped at
 // s.longPx pixels (never upscaling a small page by more than 2x).
 async function renderPageJpeg(page, s){
@@ -241,6 +258,8 @@ async function renderPageJpeg(page, s){
   var ctx = canvas.getContext("2d");
   if(s.grayscale) ctx.filter = "grayscale(100%)";
   await page.render({ canvasContext: ctx, viewport: vp }).promise;
+  ctx.filter = "none";
+  enhanceForText(ctx, canvas.width, canvas.height);
   var blob = await new Promise(function(res){ canvas.toBlob(function(b){ res(b); }, "image/jpeg", s.quality); });
   canvas.width = 1; canvas.height = 1;
   return new Uint8Array(await blob.arrayBuffer());
