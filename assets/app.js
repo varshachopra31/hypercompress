@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v9"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v10"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -136,7 +136,7 @@ function updateTargetHint(){
   if(state.targetBytes && state.targetBytes >= state.originalSize){
     msg += " That's already at or above the original — pick a smaller number to shrink it.";
   } else if(state.targetBytes){
-    msg += " We'll compress it to that size. If the target is so small the text would blur, we'll get as close as we can and tell you.";
+    msg += " We'll compress it to that size. If the target is too small for the text to stay legible, you get the smallest readable version instead — and we tell you.";
   }
   hint.textContent = msg;
 }
@@ -417,11 +417,13 @@ async function findLevel(target){
   var samples = samplePageList();
   var aim = target * 0.95; // margin so the real pass rarely overshoots
 
+  // The engine never goes below the READABLE floor: a target that would need
+  // smaller pages than that is answered with the smallest readable file and an
+  // honest message, not with smudged text that hits the number.
   setProgress(5, "Analysing the document...");
-  var estFloor = await estimateTotal(0, samples);
+  var estFloor = await estimateTotal(READABLE_FLOOR_LEVEL, samples);
   if(estFloor > target){
-    // Target is below even our most compressed rendering — deliver the floor.
-    return { level: 0, reachable: false, belowReadable: true };
+    return { level: READABLE_FLOOR_LEVEL, reachable: false, belowReadable: false, floorEstimate: estFloor };
   }
   setProgress(12, "Finding the best quality for your target...");
   var estTop = await estimateTotal(1, samples);
@@ -429,14 +431,14 @@ async function findLevel(target){
     return { level: 1, reachable: true, belowReadable: false };
   }
 
-  var lo = 0, hi = 1, best = 0;
+  var lo = READABLE_FLOOR_LEVEL, hi = 1, best = READABLE_FLOOR_LEVEL;
   for(var it = 0; it < 7; it++){
     var mid = (lo + hi) / 2;
     setProgress(14 + it * 3, "Finding the best quality for your target...");
     var est = await estimateTotal(mid, samples);
     if(est <= aim){ best = mid; lo = mid; } else { hi = mid; }
   }
-  return { level: best, reachable: true, belowReadable: best < READABLE_FLOOR_LEVEL };
+  return { level: best, reachable: true, belowReadable: false };
 }
 
 async function compressToTarget(target){
@@ -520,9 +522,12 @@ function showResult(blob, meta){
     // Rasterising this PDF can't beat it even at the most aggressive setting —
     // only happens for a file that is already tiny / pure vector. Keep the
     // original (the genuinely smaller file) and say so plainly.
+    var perPage = state.pageCount ? fmtSize(origSize / state.pageCount) : "";
     opts = {
-      title: "Can't shrink this one further",
-      note: "This PDF is already so compact that re-rendering it would only make it larger, so the original is kept. It's already near the limit for a readable document.",
+      title: "Already as small as a readable copy can be",
+      note: "This PDF is " + fmtSize(origSize) + " for " + state.pageCount + " pages (about " + perPage + " a page) — already smaller than the smallest READABLE re-rendering we can make (" + fmtSize(compSize) + "). "
+        + (target ? "Your " + fmtSize(target) + " target would need about " + fmtSize(target / Math.max(1, state.pageCount)) + " a page, which no compressor can do while keeping the text legible. " : "")
+        + "The original is kept unchanged.",
       reduction: "0% (kept original)",
       keepOriginal: true
     };
@@ -546,10 +551,14 @@ function showResult(blob, meta){
       reduction: pct + "% smaller"
     };
   } else {
-    // Floor still above target: the smallest we can make it.
+    // Readable floor is still above the target: deliver the smallest READABLE
+    // file and say plainly why the number wasn't reached.
+    var why = auto
+      ? "The " + auto + " preset would have pushed the text past legibility, so we stopped at the readable limit. "
+      : "Your " + fmtSize(target) + " target works out to about " + fmtSize(target / Math.max(1, state.pageCount)) + " a page across " + state.pageCount + " pages — below what any compressor can do while the text stays legible. ";
     opts = {
-      title: "Compressed as far as it'll go",
-      note: "This is the smallest we can make this PDF: " + fmtSize(compSize) + " (" + pct + "% smaller). Going smaller would turn the pages into unreadable smudges, so we stopped here.",
+      title: auto ? "Compressed — " + auto + " (readable limit)" : "Smallest readable version — " + fmtSize(compSize),
+      note: why + "This is the smallest this PDF can be with every page still readable: " + fmtSize(compSize) + " (" + pct + "% smaller). Use Preview to check it before downloading.",
       reduction: pct + "% smaller"
     };
   }
