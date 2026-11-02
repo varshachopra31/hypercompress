@@ -89,17 +89,22 @@ function wireUI(){
   $("#resetBtn").addEventListener("click", resetAll);
 }
 
-// A single "level" scalar in [0,1] maps to a readable (dpi, quality) pair.
-// The floor (level 0) stays at a resolution/quality where body text is still
-// legible; the ceiling (level 1) is near-lossless.
-var DPI_MIN = 100, DPI_MAX = 200, Q_MIN = 0.40, Q_MAX = 0.88;
+// A single "level" scalar in [0,1] maps to a (dpi, quality) pair. The range is
+// deliberately wide so the engine can hit almost any target: the floor
+// (level 0) is very aggressive (small, grayscale, low-res but still readable),
+// the ceiling (level 1) is near-lossless. Below READABLE_FLOOR_LEVEL the text
+// starts to soften, so we flag it but still deliver the size the user asked for.
+var DPI_MIN = 50, DPI_MAX = 220, Q_MIN = 0.15, Q_MAX = 0.92;
+var READABLE_FLOOR_LEVEL = 0.26; // ~DPI 94 / quality 0.35 — below this, warn
 
 function levelToSettings(level){
   level = Math.max(0, Math.min(1, level));
   return {
     dpi: Math.round(DPI_MIN + level * (DPI_MAX - DPI_MIN)),
     quality: Q_MIN + level * (Q_MAX - Q_MIN),
-    grayscale: !!state.allowGray
+    // Grayscale when the user opts in, or automatically at the deep-compression
+    // end where it buys a lot of size while keeping text perfectly readable.
+    grayscale: !!state.allowGray || level < 0.20
   };
 }
 
@@ -118,7 +123,7 @@ function updateTargetHint(){
   if(state.targetBytes && state.targetBytes >= state.originalSize){
     msg += " That's already at or above the original — pick a smaller number to shrink it.";
   } else if(state.targetBytes){
-    msg += " We'll keep the text readable; if your target is too small for that, we'll get as close as we can and tell you.";
+    msg += " We'll compress it to that size. If the target is so small the text would blur, we'll get as close as we can and tell you.";
   }
   hint.textContent = msg;
 }
@@ -251,8 +256,9 @@ async function estimateTotal(level, samples){
   return Math.round(avg * state.pageCount * 1.03 + 1500 + state.pageCount * 40);
 }
 
-// Binary-search the highest (best-quality) level whose estimated size fits
-// the target, never dropping below the readable floor (level 0).
+// Binary-search the highest (best-quality) level whose estimated size fits the
+// target. If even the most aggressive floor can't reach the target, we still
+// return the floor (the smallest we can make it) rather than giving up.
 async function findLevel(target){
   var samples = samplePageList();
   var aim = target * 0.95; // margin so the real pass rarely overshoots
@@ -260,22 +266,23 @@ async function findLevel(target){
   setProgress(5, "Analysing the document...");
   var estFloor = await estimateTotal(0, samples);
   if(estFloor > target){
-    return { level: 0, reachable: false, atFloor: true };
+    // Target is below even our most compressed rendering — deliver the floor.
+    return { level: 0, reachable: false, belowReadable: true };
   }
   setProgress(12, "Finding the best quality for your target...");
   var estTop = await estimateTotal(1, samples);
   if(estTop <= aim){
-    return { level: 1, reachable: true, atFloor: false };
+    return { level: 1, reachable: true, belowReadable: false };
   }
 
   var lo = 0, hi = 1, best = 0;
-  for(var it = 0; it < 6; it++){
+  for(var it = 0; it < 7; it++){
     var mid = (lo + hi) / 2;
     setProgress(14 + it * 3, "Finding the best quality for your target...");
     var est = await estimateTotal(mid, samples);
     if(est <= aim){ best = mid; lo = mid; } else { hi = mid; }
   }
-  return { level: best, reachable: true, atFloor: best < 0.02 };
+  return { level: best, reachable: true, belowReadable: best < READABLE_FLOOR_LEVEL };
 }
 
 async function compressToTarget(target){
@@ -304,7 +311,7 @@ async function compressToTarget(target){
   return {
     blob: new Blob([outBytes], { type: "application/pdf" }),
     reachable: search.reachable,
-    atFloor: search.atFloor,
+    belowReadable: search.belowReadable,
     level: search.level,
     target: target,
     settings: s
@@ -328,39 +335,45 @@ function showResult(blob, meta){
   }
 
   var compSize = blob.size;
-  var inflated = compSize >= origSize;
-  var outBlob = inflated ? state.file : blob;
-  var outSize = outBlob.size;
-
+  var pct = Math.round((1 - compSize / origSize) * 100);
   var opts;
-  if(inflated){
-    // Re-encoding grew the file (already-efficient / vector PDF): keep original.
+
+  if(compSize >= origSize){
+    // Rasterising this PDF can't beat it even at the most aggressive setting —
+    // only happens for a file that is already tiny / pure vector. Keep the
+    // original (the genuinely smaller file) and say so plainly.
     opts = {
-      title: "Already optimized",
-      note: "Re-compressing this PDF would make it larger, so the original is kept. This usually means the file is mostly text that is already efficient.",
+      title: "Can't shrink this one further",
+      note: "This PDF is already so compact that re-rendering it would only make it larger, so the original is kept. It's already near the limit for a readable document.",
       reduction: "0% (kept original)",
       keepOriginal: true
     };
-  } else if(outSize <= target){
+    finishResult(state.file, origSize, opts);
+    return;
+  }
+
+  if(compSize <= target && !meta.belowReadable){
     opts = {
       title: "Compressed to your target",
-      note: "Done — the file is now under your " + fmtSize(target) + " target and the text stays readable.",
-      reduction: Math.round((1 - outSize / origSize) * 100) + "% smaller"
+      note: "Done — now " + fmtSize(compSize) + " (" + pct + "% smaller), under your " + fmtSize(target) + " target, with the text kept sharp.",
+      reduction: pct + "% smaller"
     };
-  } else if(meta.atFloor || !meta.reachable){
+  } else if(compSize <= target && meta.belowReadable){
     opts = {
-      title: "Smallest readable size",
-      note: "We couldn't reach " + fmtSize(target) + " without making the words too blurry to read, so this is the smallest size that stays legible.",
-      reduction: Math.round((1 - outSize / origSize) * 100) + "% smaller"
+      title: "Compressed to your target",
+      note: "Hit your " + fmtSize(target) + " target (now " + fmtSize(compSize) + ", " + pct + "% smaller). To reach this size the resolution was lowered, so the text is softer — still readable, but pick a slightly larger target if you want it crisper.",
+      reduction: pct + "% smaller"
     };
   } else {
+    // Floor still above target: this is the smallest we can make it while the
+    // document stays legible.
     opts = {
-      title: "As close as we could get",
-      note: "Compressed to " + fmtSize(outSize) + " — just over your " + fmtSize(target) + " target. Going smaller would start to blur the text.",
-      reduction: Math.round((1 - outSize / origSize) * 100) + "% smaller"
+      title: "Compressed as far as it'll go",
+      note: "This is the smallest we can make it while the text stays readable: " + fmtSize(compSize) + " (" + pct + "% smaller). Your " + fmtSize(target) + " target would make the words unreadable, so we stopped here.",
+      reduction: pct + "% smaller"
     };
   }
-  finishResult(outBlob, outSize, opts);
+  finishResult(blob, compSize, opts);
 }
 
 function finishResult(blob, outSize, opts){
