@@ -295,6 +295,10 @@ body {
 .ab-name { font-size: 15px; font-weight: 700; }
 .ab-desc { font-size: 11.5px; color: var(--text-soft); }
 
+/* Options that apply to both modes */
+.ctrl-options { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--border); }
+.ctrl-options em { font-style: normal; color: var(--text-soft); }
+
 /* Presets */
 .preset-row {
   display: grid;

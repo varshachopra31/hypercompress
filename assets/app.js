@@ -10,6 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
+var BUILD = "v8"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -38,6 +39,7 @@ function fmtRatio(orig, comp){
 
 function boot(){
   wireUI();
+  var bt = $("#buildTag"); if(bt) bt.textContent = "· build " + BUILD;
 }
 
 function wireUI(){
@@ -300,16 +302,33 @@ async function encodePage(page, s){
     var v = (d[p] * 77 + d[p + 1] * 151 + d[p + 2] * 28) >> 8;
     lum[i] = v; hist[v]++;
   }
+  // Threshold selection, shading-aware. A plain text page splits cleanly into
+  // ink vs paper. A page with shaded cells or header bands has THREE classes
+  // (ink, shade, paper) and a single Otsu cut can land on either side of the
+  // shade. Text always contrasts with what it sits on, so the shade's own
+  // brightness says which way to cut: a LIGHT shade carries dark text — cut
+  // below it so it drops to white; a DARK band carries light text — keep it
+  // black so that text survives as white-on-black.
   var thr = otsuThreshold(hist, n);
-  // Text is bimodal (ink vs paper) so few pixels sit near the threshold; a
-  // photo has a continuous tone range with many pixels right at it.
+  var dark = 0;
+  for(var b0 = 0; b0 <= thr; b0++) dark += hist[b0];
+  if(dark / n > 0.12){                       // too much "ink" to be text alone → shading present
+    var sub = new Uint32Array(256);
+    for(var c0 = 0; c0 <= thr; c0++) sub[c0] = hist[c0];
+    var thr2 = otsuThreshold(sub, dark);     // split the dark class into ink vs shade
+    var bandN = 0, bandSum = 0, ink2 = 0;
+    for(var m = 0; m <= thr; m++){
+      if(m <= thr2) ink2 += hist[m]; else { bandN += hist[m]; bandSum += m * hist[m]; }
+    }
+    var bandMean = bandN ? bandSum / bandN : 0;
+    if(bandMean > 128 && ink2 / n >= 0.003) thr = thr2;   // light shade → drop it, keep the dark text
+  }
   var near = 0, ink = 0;
   for(var q = Math.max(0, thr - 24); q <= Math.min(255, thr + 24); q++) near += hist[q];
   for(var b = 0; b <= thr; b++) ink += hist[b];
-  // A photo has many pixels at the threshold. A page that would come out
-  // mostly black (heavy shading the threshold swallowed) must not be
-  // binarised either, or text inside shaded cells vanishes into solid blocks.
-  var isPhoto = (near / n) > 0.12 || (ink / n) > 0.25;
+  // Photos put many pixels right at the threshold. A page more than half
+  // black is a failed binarisation (or a photo) — keep those as JPEG.
+  var isPhoto = (near / n) > 0.12 || (ink / n) > 0.5;
 
   if(isPhoto || !HAS_DEFLATE){
     if(s.grayscale){
@@ -319,7 +338,7 @@ async function encodePage(page, s){
     var blob = await new Promise(function(res){ r.canvas.toBlob(function(b){ res(b); }, "image/jpeg", s.quality); });
     r.canvas.width = 1; r.canvas.height = 1;
     var jp = new Uint8Array(await blob.arrayBuffer());
-    return { kind: "jpeg", data: jp, bytes: jp.length };
+    return { kind: "jpeg", data: jp, bytes: jp.length, thr: thr, ink: ink / n };
   }
 
   // Pack to 1 bit per pixel, rows padded to a byte; 1 = white, 0 = ink.
@@ -332,7 +351,7 @@ async function encodePage(page, s){
   }
   r.canvas.width = 1; r.canvas.height = 1;
   var def = await deflateBytes(packed);
-  return { kind: "bilevel", data: def, width: w, height: h, bytes: def.length };
+  return { kind: "bilevel", data: def, width: w, height: h, bytes: def.length, thr: thr, ink: ink / n };
 }
 
 // Place a 1-bit deflated bitmap on a pdf-lib page as a true 1-bpc image

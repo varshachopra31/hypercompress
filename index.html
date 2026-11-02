@@ -81,9 +81,12 @@
             <span class="ab-desc">Smallest file</span>
           </button>
         </div>
+      </div>
+
+      <div class="ctrl-options">
         <label class="check-label">
           <input type="checkbox" id="grayscale">
-          <span>Allow black &amp; white, if it helps reach a smaller size</span>
+          <span>Convert photos &amp; shaded areas to grayscale for a smaller file <em>(applies to both modes &mdash; text is always kept as crisp black &amp; white)</em></span>
         </label>
       </div>
     </section>
@@ -135,7 +138,7 @@
   </main>
 
   <footer class="footer">
-    <p>100% client-side &mdash; no uploads, no servers, no tracking. Built with pdf.js + pdf-lib.</p>
+    <p>100% client-side &mdash; no uploads, no servers, no tracking. Built with pdf.js + pdf-lib. <span id="buildTag"></span></p>
   </footer>
 
   <div id="toast" class="toast"></div>
@@ -144,6 +147,6 @@
 
 <script src="assets/vendor/pdf.min.js"></script>
 <script src="assets/vendor/pdf-lib.min.js"></script>
-<script src="assets/app.js?v=7"></script>
+<script src="assets/app.js?v=8"></script>
 </body>
 </html>
