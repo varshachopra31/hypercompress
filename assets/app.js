@@ -94,17 +94,22 @@ function wireUI(){
 // (level 0) is very aggressive (small, grayscale, low-res but still readable),
 // the ceiling (level 1) is near-lossless. Below READABLE_FLOOR_LEVEL the text
 // starts to soften, so we flag it but still deliver the size the user asked for.
-var DPI_MIN = 50, DPI_MAX = 220, Q_MIN = 0.15, Q_MAX = 0.92;
-var READABLE_FLOOR_LEVEL = 0.26; // ~DPI 94 / quality 0.35 — below this, warn
+// A level maps to the longest-side PIXEL size each page is rendered at, plus a
+// JPEG quality. Capping pixels (rather than DPI) bounds the output regardless
+// of the PDF's page geometry — a scanned PDF with a huge page box no longer
+// renders a giant image. LONG_MIN is tiny (aggressive) but still legible-ish;
+// LONG_MAX is crisp. Below READABLE_FLOOR_LEVEL the text starts to soften.
+var LONG_MIN = 360, LONG_MAX = 2100, Q_MIN = 0.10, Q_MAX = 0.92;
+var READABLE_FLOOR_LEVEL = 0.22; // ~760px long side / quality 0.28
 
 function levelToSettings(level){
   level = Math.max(0, Math.min(1, level));
   return {
-    dpi: Math.round(DPI_MIN + level * (DPI_MAX - DPI_MIN)),
+    longPx: Math.round(LONG_MIN + level * (LONG_MAX - LONG_MIN)),
     quality: Q_MIN + level * (Q_MAX - Q_MIN),
-    // Grayscale when the user opts in, or automatically at the deep-compression
-    // end where it buys a lot of size while keeping text perfectly readable.
-    grayscale: !!state.allowGray || level < 0.20
+    // Grayscale when the user opts in, or automatically in the aggressive zone
+    // where it roughly halves the size while text stays perfectly readable.
+    grayscale: !!state.allowGray || level < READABLE_FLOOR_LEVEL
   };
 }
 
@@ -211,12 +216,16 @@ function setProgress(pct, label){
   $("#progressLabel").textContent = label || (Math.round(pct) + "%");
 }
 
-// Render one page to a JPEG byte array at the given settings.
+// Render one page to a JPEG byte array, with the longest side capped at
+// s.longPx pixels (never upscaling a small page by more than 2x).
 async function renderPageJpeg(page, s){
-  var vp = page.getViewport({ scale: s.dpi / 72 });
+  var base = page.getViewport({ scale: 1 });
+  var longPt = Math.max(base.width, base.height) || 1;
+  var scale = Math.min(s.longPx / longPt, 2);
+  var vp = page.getViewport({ scale: scale });
   var canvas = document.createElement("canvas");
-  canvas.width = Math.round(vp.width);
-  canvas.height = Math.round(vp.height);
+  canvas.width = Math.max(1, Math.round(vp.width));
+  canvas.height = Math.max(1, Math.round(vp.height));
   var ctx = canvas.getContext("2d");
   if(s.grayscale) ctx.filter = "grayscale(100%)";
   await page.render({ canvasContext: ctx, viewport: vp }).promise;
