@@ -85,6 +85,10 @@ function wireUI(){
 
   $("#compressBtn").addEventListener("click", startCompress);
   $("#resetBtn").addEventListener("click", resetAll);
+  $("#startOverBtn").addEventListener("click", function(){
+    resetAll();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  });
 }
 
 // A single "level" scalar in [0,1] maps to a (dpi, quality) pair. The range is
@@ -97,17 +101,35 @@ function wireUI(){
 // of the PDF's page geometry — a scanned PDF with a huge page box no longer
 // renders a giant image. LONG_MIN is tiny (aggressive) but still legible-ish;
 // LONG_MAX is crisp. Below READABLE_FLOOR_LEVEL the text starts to soften.
-var LONG_MIN = 150, LONG_MAX = 2100, Q_MIN = 0.06, Q_MAX = 0.92;
-var READABLE_FLOOR_LEVEL = 0.31; // ~755px long side / quality 0.33 — below this, text softens
+var LONG_MIN = 150, LONG_MAX = 2100;
+var READ_PX = 1300;      // a crisp, comfortably readable resolution (~157 DPI on A4)
+var KNEE = 0.5;          // level above which we only trade JPEG quality, never pixels
+var Q_LOW = 0.14, Q_MAX = 0.92;
+var READABLE_FLOOR_LEVEL = 0.27; // ~760px long side — below this, text softens
 
+// RESOLUTION-FIRST mapping. For text, pixels matter far more than JPEG quality,
+// so from level 1 down to the KNEE we hold a readable resolution and shed bytes
+// purely by lowering JPEG quality (text stays crisp, just more artefacts).
+// Only below the KNEE — when quality is already at its floor — do we start
+// lowering resolution, which is when text begins to soften.
 function levelToSettings(level){
   level = Math.max(0, Math.min(1, level));
+  var longPx, quality;
+  if(level >= KNEE){
+    var t = (level - KNEE) / (1 - KNEE);                    // 0..1 across the quality phase
+    longPx = Math.round(READ_PX + t * (LONG_MAX - READ_PX)); // 1300 -> 2100
+    quality = Q_LOW + t * (Q_MAX - Q_LOW);                  // 0.14 -> 0.92
+  } else {
+    var t2 = level / KNEE;                                  // 0..1 across the resolution phase
+    longPx = Math.round(LONG_MIN + t2 * (READ_PX - LONG_MIN)); // 150 -> 1300
+    quality = Q_LOW;
+  }
   return {
-    longPx: Math.round(LONG_MIN + level * (LONG_MAX - LONG_MIN)),
-    quality: Q_MIN + level * (Q_MAX - Q_MIN),
-    // Grayscale when the user opts in, or automatically in the aggressive zone
-    // where it roughly halves the size while text stays perfectly readable.
-    grayscale: !!state.allowGray || level < READABLE_FLOOR_LEVEL
+    longPx: longPx,
+    quality: quality,
+    // Grayscale when the user opts in, or automatically deep in the
+    // resolution phase, where it halves the size while text stays readable.
+    grayscale: !!state.allowGray || level < 0.35
   };
 }
 
@@ -446,6 +468,17 @@ function finishResult(blob, outSize, opts){
     a.click();
     URL.revokeObjectURL(a.href);
   };
+
+  // Preview: open the exact file that would be downloaded in a new tab, using
+  // the browser's own PDF viewer, so it can be checked before saving.
+  if(state.previewUrl){ URL.revokeObjectURL(state.previewUrl); state.previewUrl = null; }
+  var pv = $("#previewBtn");
+  pv.textContent = keep ? "👁 Preview original" : "👁 Preview";
+  pv.onclick = function(){
+    if(!state.previewUrl) state.previewUrl = URL.createObjectURL(blob);
+    var w = window.open(state.previewUrl, "_blank");
+    if(!w) toast("Your browser blocked the preview tab — allow pop-ups for this site and try again", "err");
+  };
 }
 
 function resetAll(){
@@ -464,6 +497,7 @@ function resetAll(){
   $("#thumbImg").classList.add("hidden");
   $("#thumbImg").src = "";
   $("#compressBtn").disabled = false;
+  if(state.previewUrl){ URL.revokeObjectURL(state.previewUrl); state.previewUrl = null; }
   state.targetBytes = 0;
   state.allowGray = false;
   var tgt = $("#targetSize"); if(tgt) tgt.value = "";

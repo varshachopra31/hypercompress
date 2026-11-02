@@ -125,7 +125,11 @@
         </div>
         <div class="result-bar-labels"><span>Compressed</span><span>Original</span></div>
       </div>
-      <button id="downloadBtn" class="btn btn-primary btn-lg">&#x2B07; Download compressed PDF</button>
+      <div class="result-actions">
+        <button id="previewBtn" class="btn btn-ghost btn-lg" title="Open the result in a new tab to check how it looks before downloading">&#x1F441; Preview</button>
+        <button id="downloadBtn" class="btn btn-primary btn-lg">&#x2B07; Download compressed PDF</button>
+        <button id="startOverBtn" class="btn btn-ghost btn-lg" title="Clear this file and compress another">&#x21BA; Start over</button>
+      </div>
     </section>
 
   </main>
@@ -140,6 +144,6 @@
 
 <script src="assets/vendor/pdf.min.js"></script>
 <script src="assets/vendor/pdf-lib.min.js"></script>
-<script src="assets/app.js?v=5"></script>
+<script src="assets/app.js?v=6"></script>
 </body>
 </html>

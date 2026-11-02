@@ -503,6 +503,15 @@ body {
   line-height: 1.5;
   color: var(--text-soft);
 }
+.result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 10px;
+}
+.result-actions .btn-ghost { border: 1.5px solid var(--border); color: var(--text); }
+.result-actions .btn-ghost:hover { border-color: var(--accent); background: var(--accent-bg); }
 .result-stats {
   display: flex;
   align-items: center;
