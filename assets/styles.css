@@ -270,6 +270,31 @@ body {
   margin: 12px 0 0;
 }
 
+/* Automatic Low / Medium / High */
+.ctrl-auto { margin-top: 26px; padding-top: 22px; border-top: 1px solid var(--border); }
+.auto-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+.autobtn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 14px 10px;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color .12s, background .12s;
+}
+.autobtn:hover { border-color: var(--accent); background: var(--accent-bg); }
+.autobtn:disabled { opacity: .5; cursor: default; }
+.ab-name { font-size: 15px; font-weight: 700; }
+.ab-desc { font-size: 11.5px; color: var(--text-soft); }
+
 /* Presets */
 .preset-row {
   display: grid;

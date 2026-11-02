@@ -52,28 +52,39 @@
     <section id="controls" class="controls hidden">
 
       <div class="ctrl-target">
-        <h3 class="ctrl-heading">Target size</h3>
-        <p class="ctrl-sub">Tell us how small you want it. We compress as close to that as possible while keeping the words readable.</p>
+        <h3 class="ctrl-heading">Compress to a target size</h3>
+        <p class="ctrl-sub">Type exactly how small you want it — we compress right down to that.</p>
         <div class="target-row">
           <div class="target-input-wrap">
             <input type="number" id="targetSize" class="target-input" min="0.1" step="0.1" value="" inputmode="decimal">
             <span class="target-unit">MB</span>
           </div>
-          <div class="target-quick">
-            <button type="button" class="qbtn" data-frac="0.5">Half</button>
-            <button type="button" class="qbtn" data-frac="0.25">Quarter</button>
-            <button type="button" class="qbtn" data-frac="0.1">Tenth</button>
-          </div>
+          <button id="compressBtn" class="btn btn-primary btn-lg">Compress</button>
         </div>
         <p id="targetHint" class="target-hint"></p>
+      </div>
+
+      <div class="ctrl-auto">
+        <h3 class="ctrl-heading">Or compress automatically</h3>
+        <p class="ctrl-sub">One click — we pick the settings for you.</p>
+        <div class="auto-row">
+          <button type="button" class="autobtn" data-auto="low">
+            <span class="ab-name">Low</span>
+            <span class="ab-desc">Lightest &middot; best quality</span>
+          </button>
+          <button type="button" class="autobtn" data-auto="medium">
+            <span class="ab-name">Medium</span>
+            <span class="ab-desc">Balanced</span>
+          </button>
+          <button type="button" class="autobtn" data-auto="high">
+            <span class="ab-name">High</span>
+            <span class="ab-desc">Smallest file</span>
+          </button>
+        </div>
         <label class="check-label">
           <input type="checkbox" id="grayscale">
           <span>Allow black &amp; white, if it helps reach a smaller size</span>
         </label>
-      </div>
-
-      <div class="ctrl-action">
-        <button id="compressBtn" class="btn btn-primary btn-lg">Compress to target</button>
       </div>
     </section>
 
@@ -129,6 +140,6 @@
 
 <script src="assets/vendor/pdf.min.js"></script>
 <script src="assets/vendor/pdf-lib.min.js"></script>
-<script src="assets/app.js?v=3"></script>
+<script src="assets/app.js?v=4"></script>
 </body>
 </html>

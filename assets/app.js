@@ -74,14 +74,12 @@ function wireUI(){
     updateTargetHint();
   });
 
-  $$("[data-frac]").forEach(function(btn){
+  // One-click automatic presets: compress to a fixed fraction of the original.
+  var AUTO = { low: { frac: 0.6, label: "Low" }, medium: { frac: 0.33, label: "Medium" }, high: { frac: 0.15, label: "High" } };
+  $$("[data-auto]").forEach(function(btn){
     btn.addEventListener("click", function(){
-      if(!state.originalSize) return;
-      var frac = parseFloat(btn.getAttribute("data-frac"));
-      var mb = state.originalSize / 1048576 * frac;
-      tgt.value = (mb < 0.1 ? 0.1 : Math.round(mb * 10) / 10);
-      state.targetBytes = parseFloat(tgt.value) * 1048576;
-      updateTargetHint();
+      var a = AUTO[btn.getAttribute("data-auto")];
+      if(a) startAutoCompress(a.frac, a.label);
     });
   });
 
@@ -99,8 +97,8 @@ function wireUI(){
 // of the PDF's page geometry — a scanned PDF with a huge page box no longer
 // renders a giant image. LONG_MIN is tiny (aggressive) but still legible-ish;
 // LONG_MAX is crisp. Below READABLE_FLOOR_LEVEL the text starts to soften.
-var LONG_MIN = 360, LONG_MAX = 2100, Q_MIN = 0.10, Q_MAX = 0.92;
-var READABLE_FLOOR_LEVEL = 0.22; // ~760px long side / quality 0.28
+var LONG_MIN = 150, LONG_MAX = 2100, Q_MIN = 0.06, Q_MAX = 0.92;
+var READABLE_FLOOR_LEVEL = 0.31; // ~755px long side / quality 0.33 — below this, text softens
 
 function levelToSettings(level){
   level = Math.max(0, Math.min(1, level));
@@ -191,20 +189,34 @@ function startCompress(){
     showResult(null, { mode: "under", target: target });
     return;
   }
+  runCompression(target, { target: target });
+}
 
-  state.compressing = true;
-  $("#compressBtn").disabled = true;
+// One-click preset: compress to a fixed fraction of the original.
+function startAutoCompress(frac, label){
+  if(state.compressing || !state.pdf) return;
+  var target = Math.max(50000, Math.round(state.originalSize * frac));
+  runCompression(target, { target: target, autoLabel: label });
+}
+
+function setBusy(on){
+  state.compressing = on;
+  $("#compressBtn").disabled = on;
+  $$("[data-auto]").forEach(function(b){ b.disabled = on; });
+}
+
+function runCompression(target, meta){
+  setBusy(true);
   $("#progressWrap").classList.remove("hidden");
   $("#resultArea").classList.add("hidden");
   setProgress(0, "Starting...");
 
   compressToTarget(target).then(function(res){
-    state.compressing = false;
-    $("#compressBtn").disabled = false;
+    setBusy(false);
+    res.autoLabel = meta.autoLabel;
     showResult(res.blob, res);
   }).catch(function(err){
-    state.compressing = false;
-    $("#compressBtn").disabled = false;
+    setBusy(false);
     toast("Compression failed: " + err.message, "err");
     setProgress(0, "Failed");
   });
@@ -361,24 +373,26 @@ function showResult(blob, meta){
     return;
   }
 
+  var auto = meta.autoLabel;
+  var softNote = " The resolution was lowered to reach this size, so the text is softer — raise the target a little if you want it crisper.";
+
   if(compSize <= target && !meta.belowReadable){
     opts = {
-      title: "Compressed to your target",
-      note: "Done — now " + fmtSize(compSize) + " (" + pct + "% smaller), under your " + fmtSize(target) + " target, with the text kept sharp.",
+      title: auto ? "Compressed — " + auto : "Compressed to your target",
+      note: "Done — now " + fmtSize(compSize) + " (" + pct + "% smaller)" + (auto ? ", with the text kept sharp." : ", under your " + fmtSize(target) + " target, with the text kept sharp."),
       reduction: pct + "% smaller"
     };
   } else if(compSize <= target && meta.belowReadable){
     opts = {
-      title: "Compressed to your target",
-      note: "Hit your " + fmtSize(target) + " target (now " + fmtSize(compSize) + ", " + pct + "% smaller). To reach this size the resolution was lowered, so the text is softer — still readable, but pick a slightly larger target if you want it crisper.",
+      title: auto ? "Compressed — " + auto : "Compressed to your target",
+      note: (auto ? "Done — now " + fmtSize(compSize) + " (" + pct + "% smaller)." : "Hit your " + fmtSize(target) + " target (now " + fmtSize(compSize) + ", " + pct + "% smaller).") + softNote,
       reduction: pct + "% smaller"
     };
   } else {
-    // Floor still above target: this is the smallest we can make it while the
-    // document stays legible.
+    // Floor still above target: the smallest we can make it.
     opts = {
       title: "Compressed as far as it'll go",
-      note: "This is the smallest we can make it while the text stays readable: " + fmtSize(compSize) + " (" + pct + "% smaller). Your " + fmtSize(target) + " target would make the words unreadable, so we stopped here.",
+      note: "This is the smallest we can make this PDF: " + fmtSize(compSize) + " (" + pct + "% smaller). Going smaller would turn the pages into unreadable smudges, so we stopped here.",
       reduction: pct + "% smaller"
     };
   }
