@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HyperCompress — private PDF compressor</title>
+<meta name="description" content="Compress a PDF to a target size, entirely in your browser. Files never leave your device.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M13 2 4 14h6l-1 8 9-12h-6z' fill='%235b4bff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-icon">&#x26A1;</span>
+      <span class="brand-name">HyperCompress</span>
+    </div>
+    <p class="brand-tag">Client-side PDF compression &mdash; your files never leave your device</p>
+  </header>
+
+  <main class="main">
+
+    <!-- Upload area -->
+    <section id="uploadArea" class="upload-section">
+      <div id="dropzone" class="dropzone">
+        <input type="file" id="fileInput" accept=".pdf" hidden>
+        <div class="dz-icon">
+          <svg width="56" height="56" viewBox="0 0 56 56" fill="none"><rect x="8" y="14" width="40" height="32" rx="4" stroke="currentColor" stroke-width="2.5"/><path d="M28 22v16m-6-6 6-6 6 6" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <p class="dz-label">Drop your PDF here, or <span class="dz-link">browse</span></p>
+        <p class="dz-hint">PDF files only &middot; processed entirely in your browser</p>
+      </div>
+    </section>
+
+    <!-- File info (shown after upload) -->
+    <section id="fileInfo" class="file-info hidden">
+      <div class="fi-row">
+        <img id="thumbImg" class="fi-thumb hidden" alt="Page 1 preview">
+        <div class="fi-meta">
+          <h2 id="fileName" class="fi-name"></h2>
+          <div class="fi-chips">
+            <span class="chip" id="fileSize"></span>
+            <span class="chip" id="filePages"></span>
+          </div>
+        </div>
+        <button id="resetBtn" class="btn btn-ghost" title="Choose a different file">&#x2715; Change</button>
+      </div>
+    </section>
+
+    <!-- Controls (shown after PDF is parsed) -->
+    <section id="controls" class="controls hidden">
+
+      <div class="ctrl-target">
+        <h3 class="ctrl-heading">Target size</h3>
+        <p class="ctrl-sub">Tell us how small you want it. We compress as close to that as possible while keeping the words readable.</p>
+        <div class="target-row">
+          <div class="target-input-wrap">
+            <input type="number" id="targetSize" class="target-input" min="0.1" step="0.1" value="" inputmode="decimal">
+            <span class="target-unit">MB</span>
+          </div>
+          <div class="target-quick">
+            <button type="button" class="qbtn" data-frac="0.5">Half</button>
+            <button type="button" class="qbtn" data-frac="0.25">Quarter</button>
+            <button type="button" class="qbtn" data-frac="0.1">Tenth</button>
+          </div>
+        </div>
+        <p id="targetHint" class="target-hint"></p>
+        <label class="check-label">
+          <input type="checkbox" id="grayscale">
+          <span>Allow black &amp; white, if it helps reach a smaller size</span>
+        </label>
+      </div>
+
+      <div class="ctrl-action">
+        <button id="compressBtn" class="btn btn-primary btn-lg">Compress to target</button>
+      </div>
+    </section>
+
+    <!-- Progress -->
+    <section id="progressWrap" class="progress-section hidden">
+      <div class="progress-track">
+        <div id="progressBar" class="progress-fill"></div>
+      </div>
+      <p id="progressLabel" class="progress-label">Starting...</p>
+    </section>
+
+    <!-- Result -->
+    <section id="resultArea" class="result-section hidden">
+      <h3 id="resultTitle" class="result-title">Compression complete</h3>
+      <p id="resultNote" class="result-note hidden"></p>
+      <div class="result-stats">
+        <div class="rs-item">
+          <span class="rs-label">Original</span>
+          <span id="resultOriginal" class="rs-val"></span>
+        </div>
+        <div class="rs-arrow">&rarr;</div>
+        <div class="rs-item">
+          <span class="rs-label">Compressed</span>
+          <span id="resultCompressed" class="rs-val accent"></span>
+        </div>
+        <div class="rs-item">
+          <span class="rs-label">Ratio</span>
+          <span id="resultRatio" class="rs-val"></span>
+        </div>
+        <div class="rs-item">
+          <span class="rs-label">Reduction</span>
+          <span id="resultReduction" class="rs-val"></span>
+        </div>
+      </div>
+      <div class="result-bar-wrap">
+        <div class="result-bar-track">
+          <div id="resultBar" class="result-bar-fill"></div>
+        </div>
+        <div class="result-bar-labels"><span>Compressed</span><span>Original</span></div>
+      </div>
+      <button id="downloadBtn" class="btn btn-primary btn-lg">&#x2B07; Download compressed PDF</button>
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    <p>100% client-side &mdash; no uploads, no servers, no tracking. Built with pdf.js + pdf-lib.</p>
+  </footer>
+
+  <div id="toast" class="toast"></div>
+
+</div>
+
+<script src="assets/vendor/pdf.min.js"></script>
+<script src="assets/vendor/pdf-lib.min.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>
