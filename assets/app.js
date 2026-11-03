@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v14"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v22"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -264,6 +264,11 @@ function yieldNow(){
 // JBIG2 (our own encoder, jbig2enc.js): the codec built for scanned text.
 // Every PDF viewer decodes it; a page costs roughly a third of deflate.
 var JB = window.JBIG2 || null;
+// Verified text mode (textmode.js + bundled Tesseract): when pixels cannot fit
+// the target, store verified CHARACTERS as real text and keep the rest as pixels.
+var HCT = window.HCText || null;
+var HAS_OCR = !!(HCT && JB && typeof Tesseract !== "undefined");
+var TEXT_PX = 2000;   // OCR + verification resolution (~190 dpi on A4)
 
 // zlib-format deflate — exactly what PDF's /FlateDecode expects.
 async function deflateBytes(u8){
@@ -310,6 +315,44 @@ async function renderPage(page, longPx){
 
 // Encode one page: 1-bit deflate for text, JPEG for photographic pages.
 // Returns { kind, data, bytes, width?, height? }.
+// Luminance analysis shared by the bitmap and text engines: per-page Otsu
+// threshold (shading-aware) + photo detection. d = RGBA pixels, n = pixels.
+function analyseLuma(d, n){
+  var hist = new Uint32Array(256), lum = new Uint8Array(n);
+  for(var i = 0, p = 0; i < n; i++, p += 4){
+    var v = (d[p] * 77 + d[p + 1] * 151 + d[p + 2] * 28) >> 8;
+    lum[i] = v; hist[v]++;
+  }
+  // Threshold selection, shading-aware. A plain text page splits cleanly into
+  // ink vs paper. A page with shaded cells or header bands has THREE classes
+  // (ink, shade, paper) and a single Otsu cut can land on either side of the
+  // shade. Text always contrasts with what it sits on, so the shade's own
+  // brightness says which way to cut: a LIGHT shade carries dark text — cut
+  // below it so it drops to white; a DARK band carries light text — keep it
+  // black so that text survives as white-on-black.
+  var thr = otsuThreshold(hist, n);
+  var dark = 0;
+  for(var b0 = 0; b0 <= thr; b0++) dark += hist[b0];
+  if(dark / n > 0.12){                       // too much "ink" to be text alone → shading present
+    var sub = new Uint32Array(256);
+    for(var c0 = 0; c0 <= thr; c0++) sub[c0] = hist[c0];
+    var thr2 = otsuThreshold(sub, dark);     // split the dark class into ink vs shade
+    var bandN = 0, bandSum = 0, ink2 = 0;
+    for(var m = 0; m <= thr; m++){
+      if(m <= thr2) ink2 += hist[m]; else { bandN += hist[m]; bandSum += m * hist[m]; }
+    }
+    var bandMean = bandN ? bandSum / bandN : 0;
+    if(bandMean > 128 && ink2 / n >= 0.003) thr = thr2;   // light shade → drop it, keep the dark text
+  }
+  var near = 0, ink = 0;
+  for(var q = Math.max(0, thr - 24); q <= Math.min(255, thr + 24); q++) near += hist[q];
+  for(var b = 0; b <= thr; b++) ink += hist[b];
+  // Photos put many pixels right at the threshold. A page more than half
+  // black is a failed binarisation (or a photo) — keep those as JPEG.
+  var isPhoto = (near / n) > 0.12 || (ink / n) > 0.5;
+  return { lum: lum, thr: thr, isPhoto: isPhoto, ink: ink / n };
+}
+
 async function encodePage(page, s){
   var r = await renderPage(page, s.longPx);
   var w = r.w, h = r.h, n = w * h;
@@ -405,14 +448,17 @@ function drawBilevel(doc, outPage, enc, w, h){
 
 // Place a JBIG2-coded page bitmap as a 1-bpc image XObject. globalsRef (the
 // shared symbol dictionary stream) is only attached to symbol-coded pages.
-function drawJbig2(doc, outPage, stream, pxW, pxH, w, h, globalsRef){
+function drawJbig2(doc, outPage, stream, pxW, pxH, w, h, globalsRef, asMask){
   var N = PDFLib.PDFName, Num = PDFLib.PDFNumber;
   var dict = doc.context.obj({});
   dict.set(N.of("Type"), N.of("XObject"));
   dict.set(N.of("Subtype"), N.of("Image"));
   dict.set(N.of("Width"), Num.of(pxW));
   dict.set(N.of("Height"), Num.of(pxH));
-  dict.set(N.of("ColorSpace"), N.of("DeviceGray"));
+  // As an image MASK only the ink is painted (background stays transparent),
+  // so the layer can sit on top of typeset text without hiding it.
+  if(asMask) dict.set(N.of("ImageMask"), PDFLib.PDFBool.True);
+  else dict.set(N.of("ColorSpace"), N.of("DeviceGray"));
   dict.set(N.of("BitsPerComponent"), Num.of(1));
   dict.set(N.of("Filter"), N.of("JBIG2Decode"));
   if(globalsRef){ var dp = doc.context.obj({}); dp.set(N.of("JBIG2Globals"), globalsRef); dict.set(N.of("DecodeParms"), dp); }
@@ -470,7 +516,7 @@ async function findLevel(target){
   setProgress(5, "Analysing the document...");
   var estFloor = await estimateTotal(READABLE_FLOOR_LEVEL, samples);
   if(estFloor > target){
-    return { level: READABLE_FLOOR_LEVEL, reachable: false, belowReadable: false, floorEstimate: estFloor };
+    return { level: READABLE_FLOOR_LEVEL, reachable: false, belowReadable: false, floorEstimate: estFloor, textMode: HAS_OCR };
   }
   setProgress(12, "Finding the best quality for your target...");
   var estTop = await estimateTotal(1, samples);
@@ -490,6 +536,7 @@ async function findLevel(target){
 
 async function compressToTarget(target){
   var search = await findLevel(target);
+  if(search.textMode) return textModeCompress(target, search);
   var s = levelToSettings(search.level);
   var pdf = state.pdf;
   var totalPages = pdf.numPages;
@@ -600,6 +647,123 @@ async function compressToTarget(target){
   };
 }
 
+// Verified text mode. Each page: render at OCR resolution, binarise, OCR,
+// verify every word (confidence + re-rendered shape + per-digit discrimination),
+// typeset the verified words as real text, and keep everything else (rules,
+// seals, signatures, unverified words) as a JBIG2 bitmap at the readable floor.
+async function textModeCompress(target, search){
+  var pdf = state.pdf, totalPages = pdf.numPages;
+  var outDoc = await PDFLib.PDFDocument.create();
+  var fontR = outDoc.embedStandardFont(PDFLib.StandardFonts.TimesRoman);
+  var fontB = outDoc.embedStandardFont(PDFLib.StandardFonts.TimesRomanBold);
+  var s = levelToSettings(READABLE_FLOOR_LEVEL);
+  setProgress(20, "Starting text recognition (the first page takes a little longer)...");
+  var ocr = await HCT.createOcrWorker(ASSET_DIR);
+  var srcDoc = null, copied = 0, tot = { words: 0, accepted: 0, textPages: 0, otherPages: 0, rejConf: 0, rejShape: 0, rejDigit: 0, rejPunct: 0 };
+  var t0 = Date.now();
+  var dict = new JB.Dictionary({ exactOnly: true }), pending = [];   // leftover pixels of every page share one glyph dictionary
+
+  // Stage 1 for a page: render, threshold, and (for text pages) start OCR.
+  // Returned promise-bearing job lets the next page's OCR overlap this one's
+  // verification and encoding.
+  async function prepare(i){
+    var page = await pdf.getPage(i);
+    var origVP = page.getViewport({ scale: 1 });
+    var r = await renderPage(page, TEXT_PX);
+    var w = r.w, h = r.h, n = w * h;
+    var A = analyseLuma(r.ctx.getImageData(0, 0, w, h).data, n);
+    var job = { i: i, page: page, origVP: origVP, w: w, h: h, photo: A.isPhoto };
+    if(A.isPhoto){ r.canvas.width = 1; r.canvas.height = 1; return job; }
+    var bits = new Uint8Array(n);
+    for(var t = 0; t < n; t++) bits[t] = A.lum[t] <= A.thr ? 1 : 0;
+    job.bits = bits;
+    job.ocr = ocr.recognize(r.canvas).then(function(res){ r.canvas.width = 1; r.canvas.height = 1; return res; }, function(err){ r.canvas.width = 1; r.canvas.height = 1; throw err; });
+    return job;
+  }
+  // Stage 2: verify, typeset, encode the residual, add the page.
+  async function finish(job){
+    var origVP = job.origVP, outPage;
+    if(job.photo){
+      var enc = await encodePage(job.page, s);
+      outPage = outDoc.addPage([origVP.width, origVP.height]);
+      if(enc.kind === "jpeg"){ var jimg = await outDoc.embedJpg(enc.data); outPage.drawImage(jimg, { x: 0, y: 0, width: origVP.width, height: origVP.height }); }
+      else if(enc.kind === "jbig2"){ var head = JB.pageInfoSegment(1, enc.width, enc.height); var st = new Uint8Array(head.length + enc.genSeg.length); st.set(head, 0); st.set(enc.genSeg, head.length); drawJbig2(outDoc, outPage, st, enc.width, enc.height, origVP.width, origVP.height, null); }
+      else drawBilevel(outDoc, outPage, enc, origVP.width, origVP.height);
+      tot.otherPages++;
+      return;
+    }
+    var res = await job.ocr, w = job.w, h = job.h;
+    var ver = HCT.verifyWords(res.data, job.bits, w, h);
+    var accepted = ver.words.filter(function(wd){ try { (wd.bold ? fontB : fontR).encodeText(wd.text); return true; } catch(e){ return false; } });
+    tot.words += ver.stats.words; tot.accepted += accepted.length; tot.rejConf += ver.stats.rejConf; tot.rejShape += ver.stats.rejShape; tot.rejDigit += ver.stats.rejDigit; tot.rejPunct += ver.stats.rejPunct || 0;
+    var outW = Math.max(1, Math.round(w * s.longPx / Math.max(w, h))), outH = Math.max(1, Math.round(h * s.longPx / Math.max(w, h)));
+    var resid = HCT.residualBitmap(job.bits, w, h, accepted, outW, outH);
+    job.bits = null;
+    outPage = outDoc.addPage([origVP.width, origVP.height]);
+    if(accepted.length){
+      var pageFonts = { R: { obj: fontR, name: outPage.node.newFontDictionary("F1", fontR.ref) }, B: { obj: fontB, name: outPage.node.newFontDictionary("F2", fontB.ref) } };
+      HCT.typeset(PDFLib, outDoc, outPage, accepted, pageFonts, origVP.width / w, origVP.height / h, origVP.height);
+    }
+    if(resid.ink){
+      var an = JB.analysePage(resid.bits, outW, outH, dict);
+      pending.push({ page: outPage, an: an, outW: outW, outH: outH, w: origVP.width, h: origVP.height });
+    }
+    tot.textPages++;
+  }
+  async function copyOriginal(i){
+    if(!srcDoc) srcDoc = await PDFLib.PDFDocument.load(new Uint8Array(await state.file.arrayBuffer()), { ignoreEncryption: true, updateMetadata: false });
+    var cp = await outDoc.copyPages(srcDoc, [i - 1]);
+    outDoc.addPage(cp[0]); copied++;
+  }
+
+  var ahead = (ocr.size || 1) > 1 ? 1 : 0;      // how many pages to keep in flight ahead of the one being finished
+  var queue = [];
+  for(var k = 1; k <= Math.min(totalPages, 1 + ahead); k++){ try { queue.push(prepare(k)); } catch(e){ queue.push(Promise.reject(e)); } }
+  for(var i = 1; i <= totalPages; i++){
+    var done = i - 1, elapsed = (Date.now() - t0) / 1000, eta = done ? Math.round(elapsed / done * (totalPages - done)) : 0;
+    setProgress(20 + (i - 1) / totalPages * 77, "Recognising page " + i + " of " + totalPages + (done ? "... about " + (eta >= 90 ? Math.round(eta / 60) + " min" : eta + " s") + " left" : "..."));
+    var job = null, pagesDone = outDoc.getPageCount();
+    try {
+      job = await queue.shift();
+      await finish(job);
+    } catch(pageErr){
+      console.warn("HyperCompress: page " + i + " could not be re-encoded in text mode, copying the original", pageErr);
+      while(outDoc.getPageCount() > pagesDone){ try { outDoc.removePage(outDoc.getPageCount() - 1); } catch(e){ break; } }
+      try { await copyOriginal(i); } catch(e2){ console.error(e2); }
+    }
+    if(job && job.page) job.page.cleanup();
+    var nxt = i + 1 + ahead;
+    if(nxt <= totalPages){ try { queue.push(prepare(nxt)); } catch(e){ queue.push(Promise.reject(e)); } }
+    if(i % 25 === 0){ try { await pdf.cleanup(); } catch(e){} }
+    await yieldNow();
+  }
+  await HCT.terminateOcr();
+  // Leftover-pixel layers: one shared dictionary, then each page's symbol +
+  // rules stream, painted as a mask over the text.
+  if(pending.length){
+    setProgress(97, "Writing the leftover-pixel layers (" + dict.syms.length + " shapes)...");
+    await yieldNow();
+    var G = JB.buildGlobals(dict, 1), globalsRef = null;
+    if(G.numSyms) globalsRef = outDoc.context.register(PDFLib.PDFRawStream.of(outDoc.context.obj({}), G.globals));
+    for(var p = 0; p < pending.length; p++){
+      var pd = pending[p], usesSyms = pd.an.quads.length > 0 && G.numSyms > 0;
+      var stream = JB.buildPage(pd.outW, pd.outH, pd.an, G);
+      drawJbig2(outDoc, pd.page, stream, pd.outW, pd.outH, pd.w, pd.h, usesSyms ? globalsRef : null, true);
+      pending[p] = null;
+      if(p % 20 === 0) await yieldNow();
+    }
+  }
+  console.info("HyperCompress text mode: " + tot.textPages + " text page(s), " + tot.otherPages + " image page(s), " + tot.accepted + " of " + tot.words + " words verified (rejected: confidence " + tot.rejConf + ", shape " + tot.rejShape + ", digit " + tot.rejDigit + ", punctuation " + tot.rejPunct + ")" + (copied ? ", " + copied + " copied unchanged" : "") + " in " + Math.round((Date.now() - t0) / 1000) + " s");
+  setProgress(98, "Assembling PDF...");
+  var outBytes = await outDoc.save();
+  setProgress(100, "Done!");
+  return {
+    blob: new Blob([outBytes], { type: "application/pdf" }),
+    reachable: true, belowReadable: false, textMode: true, verified: tot,
+    level: READABLE_FLOOR_LEVEL, target: target, settings: s
+  };
+}
+
 function showResult(blob, meta){
   meta = meta || {};
   var origSize = state.originalSize;
@@ -638,6 +802,15 @@ function showResult(blob, meta){
   }
 
   var auto = meta.autoLabel;
+  if(meta.textMode){
+    var v = meta.verified || {}, pctV = v.words ? Math.round(v.accepted / v.words * 100) : 0;
+    var how = "Text mode: the page images could not reach this size, so every word that passed verification (" + pctV + "% of " + v.words + " words — OCR confidence, re-rendered shape and a per-digit check) is stored as real, searchable text; everything else — rules, seals, signatures and any unverified word — is kept as the original pixels.";
+    opts = compSize <= target
+      ? { title: auto ? "Compressed — " + auto + " (text mode)" : "Compressed to your target — text mode", note: "Done — now " + fmtSize(compSize) + " (" + pct + "% smaller)" + (auto ? ". " : ", under your " + fmtSize(target) + " target. ") + how, reduction: pct + "% smaller" }
+      : { title: "Smallest readable version — text mode — " + fmtSize(compSize), note: "Even as verified text this PDF is " + fmtSize(compSize) + " (" + pct + "% smaller), above your " + fmtSize(target) + " target — that is the character count of the document itself. " + how, reduction: pct + "% smaller" };
+    finishResult(blob, compSize, opts);
+    return;
+  }
   var softNote = " The resolution was lowered to reach this size, so the text is softer — raise the target a little if you want it crisper.";
 
   if(compSize <= target && !meta.belowReadable){
