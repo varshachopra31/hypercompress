@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v13"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v14"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -537,8 +537,20 @@ async function compressToTarget(target){
     setProgress(81, "Building the shared glyph dictionary (" + dict.syms.length + " shapes)...");
     await yieldNow();
     G = JB.buildGlobals(dict, 1);                     // measured: one-offs are cheaper in the dictionary than drawn in place
-    if(G.numSyms){ globalsRef = outDoc.context.register(PDFLib.PDFRawStream.of(outDoc.context.obj({}), G.globals)); }
-    perSym = G.numSyms ? G.globals.length / totalPages : 0;   // dictionary cost shared evenly by the pages
+    perSym = G.numSyms ? G.globals.length / G.numSyms : 0;   // bytes one shape costs in the dictionary
+    // Decide per page first (symbol stream + the dictionary bytes of the
+    // shapes it introduced, vs the plain bitmap), then keep in the dictionary
+    // only the shapes the symbol-coded pages really use.
+    var used = new Uint8Array(dict.syms.length), anyUsed = false;
+    for(var d0 = 0; d0 < totalPages; d0++){
+      var pl = plan[d0]; if(!pl || pl.copy || pl.enc.kind !== "jbig2" || !pl.an.quads.length) continue;
+      var probe = JB.buildPage(pl.enc.width, pl.enc.height, pl.an, G);
+      pl.useSym = probe.length + pl.an.newSyms * perSym < pl.enc.genSeg.length + 60;
+      if(pl.useSym){ anyUsed = true; var qq = pl.an.quads; for(var u = 0; u < qq.length; u += 4) used[qq[u]] = 1; }
+      if(d0 % 10 === 0) await yieldNow();
+    }
+    G = anyUsed ? JB.buildGlobals(dict, 1, used) : null;
+    if(G && G.numSyms){ globalsRef = outDoc.context.register(PDFLib.PDFRawStream.of(outDoc.context.obj({}), G.globals)); }
   }
   for(var j = 0; j < totalPages; j++){
     setProgress(82 + j / totalPages * 15, "Writing page " + (j + 1) + " of " + totalPages + "...");
@@ -553,9 +565,8 @@ async function compressToTarget(target){
     if(e.kind === "jbig2"){
       var stream = null;
       var useGlobals = false;
-      if(G && it.an.quads.length){
-        var symStream = JB.buildPage(e.width, e.height, it.an, G);
-        if(symStream.length + perSym < e.genSeg.length + 60){ stream = symStream; symPages++; useGlobals = G.numSyms > 0; }
+      if(G && it.useSym){
+        stream = JB.buildPage(e.width, e.height, it.an, G); symPages++; useGlobals = G.numSyms > 0;
       }
       if(!stream){
         var head = JB.pageInfoSegment(1, e.width, e.height);

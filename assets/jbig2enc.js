@@ -386,10 +386,11 @@ function analysePage(bits, W, H, dict, opts){
 // minUses: a shape used fewer times than this stays OUT of the dictionary
 // (remap -1) and is drawn in place by buildPage - cheaper for one-offs, and
 // it keeps the symbol id code short for everything else.
-function buildGlobals(dict, minUses){
+// used (optional): Uint8Array flag per shape id - only flagged shapes are kept.
+function buildGlobals(dict, minUses, used){
   minUses = minUses || 1;
   var order = [];
-  for(var i = 0; i < dict.syms.length; i++) if(dict.syms[i].uses >= minUses) order.push(i);
+  for(var i = 0; i < dict.syms.length; i++) if(dict.syms[i].uses >= minUses && (!used || used[i])) order.push(i);
   order.sort(function(a, b){ var A = dict.syms[a], B = dict.syms[b]; return A.h - B.h || A.w - B.w || a - b; });
   var remap = new Int32Array(dict.syms.length).fill(-1), sorted = [];
   for(var k = 0; k < order.length; k++){ remap[order[k]] = k; sorted.push(dict.syms[order[k]]); }
