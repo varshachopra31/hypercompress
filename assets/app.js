@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v10"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v11"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -250,6 +250,9 @@ function setProgress(pct, label){
 // detected and kept as JPEG at a sane quality.
 
 var HAS_DEFLATE = typeof CompressionStream !== "undefined";
+// JBIG2 (our own encoder, jbig2enc.js): the codec built for scanned text.
+// Every PDF viewer decodes it; a page costs roughly a third of deflate.
+var JB = window.JBIG2 || null;
 
 // zlib-format deflate — exactly what PDF's /FlateDecode expects.
 async function deflateBytes(u8){
@@ -344,7 +347,18 @@ async function encodePage(page, s){
     return { kind: "jpeg", data: jp, bytes: jp.length, thr: thr, ink: ink / n };
   }
 
-  // Pack to 1 bit per pixel, rows padded to a byte; 1 = white, 0 = ink.
+  r.canvas.width = 1; r.canvas.height = 1;
+  if(JB){
+    // 1 = ink bitmap for the JBIG2 encoder; its final size is only known once
+    // the page is analysed, so bytes is the generic-region cost (the upper
+    // bound of what we will store - symbol coding can only make it smaller).
+    var bits = new Uint8Array(n);
+    for(var t = 0; t < n; t++) bits[t] = lum[t] <= thr ? 1 : 0;
+    var genSeg = JB.genericRegionSegment(2, bits, w, h);
+    return { kind: "jbig2", bits: bits, genSeg: genSeg, width: w, height: h, bytes: genSeg.length + 60, thr: thr, ink: ink / n };
+  }
+  // Fallback without the JBIG2 module: pack to 1 bit per pixel, rows padded
+  // to a byte; 1 = white, 0 = ink; stored with deflate.
   var rowBytes = (w + 7) >> 3, packed = new Uint8Array(rowBytes * h);
   for(var y = 0; y < h; y++){
     var ro = y * rowBytes, lo = y * w;
@@ -352,7 +366,6 @@ async function encodePage(page, s){
       if(lum[lo + x] > thr) packed[ro + (x >> 3)] |= (0x80 >> (x & 7));
     }
   }
-  r.canvas.width = 1; r.canvas.height = 1;
   var def = await deflateBytes(packed);
   return { kind: "bilevel", data: def, width: w, height: h, bytes: def.length, thr: thr, ink: ink / n };
 }
@@ -370,6 +383,29 @@ function drawBilevel(doc, outPage, enc, w, h){
   dict.set(N.of("BitsPerComponent"), Num.of(1));
   dict.set(N.of("Filter"), N.of("FlateDecode"));
   var ref = doc.context.register(PDFLib.PDFRawStream.of(dict, enc.data));
+  var name = outPage.node.newXObject("Im", ref);
+  outPage.pushOperators(
+    PDFLib.pushGraphicsState(),
+    PDFLib.concatTransformationMatrix(w, 0, 0, h, 0, 0),
+    PDFLib.drawObject(name),
+    PDFLib.popGraphicsState()
+  );
+}
+
+// Place a JBIG2-coded page bitmap as a 1-bpc image XObject. globalsRef (the
+// shared symbol dictionary stream) is only attached to symbol-coded pages.
+function drawJbig2(doc, outPage, stream, pxW, pxH, w, h, globalsRef){
+  var N = PDFLib.PDFName, Num = PDFLib.PDFNumber;
+  var dict = doc.context.obj({});
+  dict.set(N.of("Type"), N.of("XObject"));
+  dict.set(N.of("Subtype"), N.of("Image"));
+  dict.set(N.of("Width"), Num.of(pxW));
+  dict.set(N.of("Height"), Num.of(pxH));
+  dict.set(N.of("ColorSpace"), N.of("DeviceGray"));
+  dict.set(N.of("BitsPerComponent"), Num.of(1));
+  dict.set(N.of("Filter"), N.of("JBIG2Decode"));
+  if(globalsRef){ var dp = doc.context.obj({}); dp.set(N.of("JBIG2Globals"), globalsRef); dict.set(N.of("DecodeParms"), dp); }
+  var ref = doc.context.register(PDFLib.PDFRawStream.of(dict, stream));
   var name = outPage.node.newXObject("Im", ref);
   outPage.pushOperators(
     PDFLib.pushGraphicsState(),
@@ -449,40 +485,85 @@ async function compressToTarget(target){
   var outDoc = await PDFLib.PDFDocument.create();
   var srcDoc = null, copied = 0;
 
+  // PASS 1 - render, binarise and analyse every page. Text pages are split
+  // into glyphs that go into ONE dictionary shared by the whole document
+  // (every distinct letter shape is stored once), plus a per-page list of
+  // where each glyph sits. Only the compact results are kept per page.
+  var dict = JB ? new JB.Dictionary() : null;
+  var plan = new Array(totalPages);
   for(var i = 1; i <= totalPages; i++){
-    setProgress(35 + (i - 1) / totalPages * 60, "Compressing page " + i + " of " + totalPages + "...");
+    setProgress(35 + (i - 1) / totalPages * 45, "Reading page " + i + " of " + totalPages + "...");
     var page = null;
     try {
       page = await pdf.getPage(i);
       var enc = await encodePage(page, s);
       var origVP = page.getViewport({ scale: 1 });
-      var outPage = outDoc.addPage([origVP.width, origVP.height]);
-      if(enc.kind === "bilevel"){
-        drawBilevel(outDoc, outPage, enc, origVP.width, origVP.height);
-      } else {
-        var img = await outDoc.embedJpg(enc.data);
-        outPage.drawImage(img, { x: 0, y: 0, width: origVP.width, height: origVP.height });
+      var item = { w: origVP.width, h: origVP.height, enc: enc };
+      if(enc.kind === "jbig2"){
+        item.an = JB.analysePage(enc.bits, enc.width, enc.height, dict);
+        enc.bits = null;                                   // the bitmap is no longer needed
       }
+      plan[i - 1] = item;
     } catch(pageErr){
       // One page the renderer can't handle must not sink a 700-page run:
       // carry that page over from the original file untouched instead.
       console.warn("HyperCompress: page " + i + " could not be re-encoded, copying the original", pageErr);
-      if(!srcDoc){
-        srcDoc = await PDFLib.PDFDocument.load(new Uint8Array(await state.file.arrayBuffer()), { ignoreEncryption: true, updateMetadata: false });
-      }
-      var cp = await outDoc.copyPages(srcDoc, [i - 1]);
-      outDoc.addPage(cp[0]);
-      copied++;
+      plan[i - 1] = { copy: true };
     }
     // pdf.js caches every decoded image it has drawn (a scanned page's
     // background alone is ~9 MB decoded). Across hundreds of pages that
-    // exhausts memory and the run dies with "Compression failed", so release
-    // each page's decoded resources as soon as it has been encoded.
+    // exhausts memory, so release each page's decoded resources at once.
     if(page) page.cleanup();
     if(i % 50 === 0){ try { await pdf.cleanup(); } catch(e){} }
-    if(i % 5 === 0){ await new Promise(function(r){ setTimeout(r, 0); }); }
+    if(i % 3 === 0){ await new Promise(function(r){ setTimeout(r, 0); }); }
+  }
+
+  // PASS 2 - write the shared dictionary once, then each page. A page is
+  // stored symbol-coded when that is smaller than coding it as one bitmap
+  // (its share of the dictionary counted), else as the plain lossless bitmap.
+  var G = null, globalsRef = null, perSym = 0, symPages = 0, genPages = 0;
+  if(dict && dict.syms.length){
+    setProgress(81, "Building the shared glyph dictionary (" + dict.syms.length + " shapes)...");
+    await new Promise(function(r){ setTimeout(r, 0); });
+    G = JB.buildGlobals(dict);
+    globalsRef = outDoc.context.register(PDFLib.PDFRawStream.of(outDoc.context.obj({}), G.globals));
+    perSym = G.globals.length / G.numSyms;
+  }
+  for(var j = 0; j < totalPages; j++){
+    setProgress(82 + j / totalPages * 15, "Writing page " + (j + 1) + " of " + totalPages + "...");
+    var it = plan[j];
+    if(it.copy){
+      if(!srcDoc) srcDoc = await PDFLib.PDFDocument.load(new Uint8Array(await state.file.arrayBuffer()), { ignoreEncryption: true, updateMetadata: false });
+      var cp = await outDoc.copyPages(srcDoc, [j]);
+      outDoc.addPage(cp[0]); copied++;
+      continue;
+    }
+    var outPage = outDoc.addPage([it.w, it.h]), e = it.enc;
+    if(e.kind === "jbig2"){
+      var stream = null;
+      if(G && it.an.quads.length){
+        var symStream = JB.buildPage(e.width, e.height, it.an, G);
+        var symCost = symStream.length + it.an.newSyms * perSym;
+        if(symCost < e.genSeg.length + 60){ stream = symStream; symPages++; }
+      }
+      var useGlobals = !!stream;
+      if(!stream){
+        var head = JB.pageInfoSegment(1, e.width, e.height);
+        stream = new Uint8Array(head.length + e.genSeg.length); stream.set(head, 0); stream.set(e.genSeg, head.length);
+        genPages++;
+      }
+      drawJbig2(outDoc, outPage, stream, e.width, e.height, it.w, it.h, useGlobals ? globalsRef : null);
+    } else if(e.kind === "bilevel"){
+      drawBilevel(outDoc, outPage, e, it.w, it.h);
+    } else {
+      var img = await outDoc.embedJpg(e.data);
+      outPage.drawImage(img, { x: 0, y: 0, width: it.w, height: it.h });
+    }
+    plan[j] = null;
+    if(j % 10 === 0){ await new Promise(function(r){ setTimeout(r, 0); }); }
   }
   if(copied) console.warn("HyperCompress: " + copied + " page(s) were copied from the original unchanged.");
+  console.info("HyperCompress: " + symPages + " symbol-coded page(s), " + genPages + " bitmap-coded, dictionary " + (G ? G.numSyms + " shapes / " + Math.round(G.globals.length / 1024) + " KB" : "none"));
 
   setProgress(97, "Assembling PDF...");
   var outBytes = await outDoc.save();
@@ -640,7 +721,7 @@ function toast(msg, cls){
 }
 
 // Test hook (same convention as the other dashboards' window.__xbrl / __mca).
-window.__hc = { encodePage: encodePage, drawBilevel: drawBilevel, deflateBytes: deflateBytes,
+window.__hc = { JB: JB,  encodePage: encodePage, drawBilevel: drawBilevel, deflateBytes: deflateBytes,
   otsuThreshold: otsuThreshold, levelToSettings: levelToSettings, state: state };
 
 if(document.readyState === "loading"){
