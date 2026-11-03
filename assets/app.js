@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v25"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v26"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -96,13 +96,13 @@ function wireUI(){
 // A single "level" scalar in [0,1] maps to a (dpi, quality) pair. The range is
 // deliberately wide so the engine can hit almost any target: the floor
 // (level 0) is very aggressive (small, grayscale, low-res but still readable),
-// the ceiling (level 1) is near-lossless. Below READABLE_FLOOR_LEVEL the text
+// the ceiling (level 1) is near-lossless. Below floorLevel() the text
 // starts to soften, so we flag it but still deliver the size the user asked for.
 // A level maps to the longest-side PIXEL size each page is rendered at, plus a
 // JPEG quality. Capping pixels (rather than DPI) bounds the output regardless
 // of the PDF's page geometry — a scanned PDF with a huge page box no longer
 // renders a giant image. LONG_MIN is tiny (aggressive) but still legible-ish;
-// LONG_MAX is crisp. Below READABLE_FLOOR_LEVEL the text starts to soften.
+// LONG_MAX is crisp. Below floorLevel() the text starts to soften.
 // Text pages are stored as 1-bit black & white (see encodePage), so the only
 // size lever for them is RESOLUTION — a 1-bit page is razor sharp at any size,
 // it just carries less detail as the pixel count drops. The level scalar maps
@@ -110,7 +110,55 @@ function wireUI(){
 // quality is tied to the same level but never allowed to go destructive.
 var LONG_MIN = 450, LONG_MAX = 2400;
 var READABLE_PX = 1050;  // ~90 DPI on A4 — below this, small 1-bit text starts to break up
-var READABLE_FLOOR_LEVEL = (READABLE_PX - LONG_MIN) / (LONG_MAX - LONG_MIN);
+// The top of the scale is the document's own NATIVE resolution when it is a
+// scan (the pixel size of its page images - a 300 dpi scan is 2479x3506 on
+// A4), because rendering at exactly that size reproduces the scanner's text
+// layer pixel-for-pixel; anything else resamples it. Detected from the sample
+// pages in findLevel (state.topPx); LONG_MAX is the floor of that ceiling and
+// NATIVE_CAP bounds memory (a 600 dpi scan is rendered at 300).
+var NATIVE_CAP = 3600;
+function topPx(){ return state.topPx || LONG_MAX; }
+function floorLevel(){ return (READABLE_PX - LONG_MIN) / (topPx() - LONG_MIN); }
+function mulM(m, n){ return [m[0]*n[0]+m[2]*n[1], m[1]*n[0]+m[3]*n[1], m[0]*n[2]+m[2]*n[3], m[1]*n[2]+m[3]*n[3], m[0]*n[4]+m[2]*n[5]+m[4], m[1]*n[4]+m[3]*n[5]+m[5]]; }
+// Long-side pixel count at which this page's largest page image is drawn 1:1
+// (0 when the page has no sizeable image, e.g. a vector page).
+async function nativeLongPx(page){
+  if(page._hcNative != null) return page._hcNative;
+  var best = 0;
+  try {
+    var ops = await page.getOperatorList(), O = pdfjsLib.OPS, vp = page.getViewport({ scale: 1 });
+    var ctm = [1, 0, 0, 1, 0, 0], stack = [];
+    for(var i = 0; i < ops.fnArray.length; i++){
+      var f = ops.fnArray[i], g = ops.argsArray[i];
+      if(f === O.save) stack.push(ctm.slice());
+      else if(f === O.restore) ctm = stack.pop() || [1, 0, 0, 1, 0, 0];
+      else if(f === O.transform) ctm = mulM(ctm, g);
+      else if(f === O.paintImageMaskXObject || f === O.paintImageXObject || f === O.paintJpegXObject){
+        var w = 0, h = 0;
+        if(f === O.paintImageMaskXObject){ w = g[0].width; h = g[0].height; }
+        else { var ob = null; try { ob = page.objs.get(g[0]); } catch(e){} if(ob){ w = ob.width; h = ob.height; } }
+        if(!(w > 0 && h > 0)) continue;
+        var wPt = Math.hypot(ctm[0], ctm[1]), hPt = Math.hypot(ctm[2], ctm[3]);   // the unit square under the ctm, in points
+        if(!(wPt > 1 && hPt > 1) || wPt * hPt < 0.2 * vp.width * vp.height) continue;   // a logo or seal, not the page image
+        var sc = Math.max(w / wPt, h / hPt);
+        best = Math.max(best, Math.round(Math.max(vp.width, vp.height) * sc));
+      }
+    }
+  } catch(e){}
+  page._hcNative = best;
+  return best;
+}
+// The document's top resolution: the largest native size among the sample
+// pages, never below LONG_MAX, never above NATIVE_CAP.
+async function documentTopPx(samples){
+  var nat = 0;
+  for(var k = 0; k < samples.length; k++){
+    var page = await state.pdf.getPage(samples[k]);
+    nat = Math.max(nat, await nativeLongPx(page));
+  }
+  state.topPx = nat ? Math.min(NATIVE_CAP, Math.max(LONG_MAX, nat)) : LONG_MAX;
+  return state.topPx;
+}
 // The floor is really a LETTER size, not a page width: a page of small print
 // (a landscape financial table at 6-7 pt) needs more pixels than a page of
 // body text to read equally well. Every page is rendered large enough that
@@ -120,7 +168,7 @@ var MIN_GLYPH_PX = 10;
 function levelToSettings(level){
   level = Math.max(0, Math.min(1, level));
   return {
-    longPx: Math.round(LONG_MIN + level * (LONG_MAX - LONG_MIN)),
+    longPx: Math.round(LONG_MIN + level * (topPx() - LONG_MIN)),
     quality: 0.45 + level * 0.45,   // photo pages only: 0.45 -> 0.90
     minGlyph: MIN_GLYPH_PX,
     grayscale: !!state.allowGray
@@ -309,7 +357,7 @@ function otsuThreshold(hist, total){
 async function renderPage(page, longPx){
   var base = page.getViewport({ scale: 1 });
   var longPt = Math.max(base.width, base.height) || 1;
-  var scale = Math.min(longPx / longPt, 3);
+  var scale = Math.min(longPx / longPt, 5);
   var vp = page.getViewport({ scale: scale });
   var canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.round(vp.width));
@@ -373,15 +421,15 @@ async function encodePage(page, s){
     // search renders the same sample pages at many levels, so measure each
     // page once and scale the score with the resolution (it grows a touch
     // slower than linearly, hence the 0.9) - re-measured only after a bump.
-    if(px >= LONG_MAX) break;                                  // cannot be made any larger anyway
+    if(px >= topPx()) break;                                   // cannot be made any larger anyway
     var cache = page._hcGlyph;
     if(cache && pass === 0) glyph = cache.px === px ? cache.g : Math.floor(cache.g * Math.pow(px / cache.px, 0.9));
     else { glyph = JB.textSizePx(bits, w, h); page._hcGlyph = { px: px, g: glyph }; }
     // Small print: render again, larger, until the letters are big enough to
     // read (two tries at most - the measure grows a little slower than the
     // scale, so aim 10% past the mark).
-    if(!glyph || glyph >= s.minGlyph || px >= LONG_MAX || pass >= 2) break;
-    px = Math.min(LONG_MAX, Math.ceil(px * s.minGlyph / glyph * 1.1));
+    if(!glyph || glyph >= s.minGlyph || px >= topPx() || pass >= 2) break;
+    px = Math.min(topPx(), Math.ceil(px * s.minGlyph / glyph * 1.1));
     r.canvas.width = 1; r.canvas.height = 1; bits = null;
   }
   var lum = A.lum, thr = A.thr, isPhoto = A.isPhoto, ink = A.ink;
@@ -510,9 +558,10 @@ async function findLevel(target, corr){
   // smaller pages than that is answered with the smallest readable file and an
   // honest message, not with smudged text that hits the number.
   setProgress(5, "Analysing the document...");
-  var estFloor = await estimateTotal(READABLE_FLOOR_LEVEL, samples, corr);
+  await documentTopPx(samples);
+  var estFloor = await estimateTotal(floorLevel(), samples, corr);
   if(estFloor > target){
-    return { level: READABLE_FLOOR_LEVEL, reachable: false, belowReadable: false, floorEstimate: estFloor, estimate: estFloor, textMode: HAS_OCR };
+    return { level: floorLevel(), reachable: false, belowReadable: false, floorEstimate: estFloor, estimate: estFloor, textMode: HAS_OCR };
   }
   setProgress(12, "Finding the best quality for your target...");
   var estTop = await estimateTotal(1, samples, corr);
@@ -520,7 +569,7 @@ async function findLevel(target, corr){
     return { level: 1, reachable: true, belowReadable: false, estimate: estTop };
   }
 
-  var lo = READABLE_FLOOR_LEVEL, hi = 1, best = READABLE_FLOOR_LEVEL, bestEst = estFloor;
+  var lo = floorLevel(), hi = 1, best = floorLevel(), bestEst = estFloor;
   for(var it = 0; it < 7; it++){
     var mid = (lo + hi) / 2;
     setProgress(14 + it * 3, "Finding the best quality for your target...");
@@ -549,7 +598,7 @@ async function compressToTarget(target){
     var actual = result.blob.size, est = search.estimate || actual;
     if(!best || (actual <= target && (best.blob.size > target || result.level > best.level)) || (best.blob.size > target && actual < best.blob.size)) best = result;
     var under = actual < target * 0.8 && search.level < 1 - 1e-6;
-    var over = actual > target && search.level > READABLE_FLOOR_LEVEL + 1e-6;
+    var over = actual > target && search.level > floorLevel() + 1e-6;
     if(!(under || over) || attempt === 2 || !(est > 0)) break;
     corr *= actual / est;
     console.info("HyperCompress: pass " + (attempt + 1) + " produced " + actual + " bytes against an estimate of " + est + " - re-running at the level the target pays for (calibration x" + corr.toFixed(2) + ")");
@@ -679,7 +728,7 @@ async function textModeCompress(target, search){
   var outDoc = await PDFLib.PDFDocument.create();
   var fontR = outDoc.embedStandardFont(PDFLib.StandardFonts.TimesRoman);
   var fontB = outDoc.embedStandardFont(PDFLib.StandardFonts.TimesRomanBold);
-  var s = levelToSettings(READABLE_FLOOR_LEVEL);
+  var s = levelToSettings(floorLevel());
   setProgress(20, "Starting text recognition (the first page takes a little longer)...");
   var ocr = await HCT.createOcrWorker(ASSET_DIR);
   var srcDoc = null, copied = 0, tot = { words: 0, accepted: 0, textPages: 0, otherPages: 0, rejConf: 0, rejShape: 0, rejDigit: 0, rejPunct: 0 };
@@ -790,7 +839,7 @@ async function textModeCompress(target, search){
   return {
     blob: new Blob([outBytes], { type: "application/pdf" }),
     reachable: true, belowReadable: false, textMode: true, verified: tot,
-    level: READABLE_FLOOR_LEVEL, target: target, settings: s
+    level: floorLevel(), target: target, settings: s
   };
 }
 
@@ -849,7 +898,7 @@ function showResult(blob, meta){
     // the maximum resolution, and a bigger target cannot buy anything more.
     var slack = "";
     if(!auto && target && compSize < target * 0.8){
-      if(meta.level >= 1 - 1e-6) slack = " This is the full-quality version — every page is stored at the maximum resolution (" + ((meta.settings && meta.settings.longPx) || LONG_MAX) + " px on its long side), so a larger target would not change it.";
+      if(meta.level >= 1 - 1e-6) slack = " This is the full-quality version — every page is stored at the maximum resolution (" + ((meta.settings && meta.settings.longPx) || topPx()) + " px on its long side), so a larger target would not change it.";
       else slack = " The engine ran " + (meta.passes || 1) + " pass" + ((meta.passes || 1) > 1 ? "es" : "") + " to use as much of your target as its size estimate allowed.";
     }
     opts = {
@@ -953,7 +1002,7 @@ function toast(msg, cls){
 }
 
 // Test hook (same convention as the other dashboards' window.__xbrl / __mca).
-window.__hc = { JB: JB,  encodePage: encodePage, drawBilevel: drawBilevel, deflateBytes: deflateBytes,
+window.__hc = { JB: JB, encodePage: encodePage, nativeLongPx: nativeLongPx, documentTopPx: documentTopPx, floorLevel: floorLevel, topPx: topPx, samplePageList: samplePageList, drawBilevel: drawBilevel, deflateBytes: deflateBytes,
   otsuThreshold: otsuThreshold, levelToSettings: levelToSettings, state: state };
 
 if(document.readyState === "loading"){
