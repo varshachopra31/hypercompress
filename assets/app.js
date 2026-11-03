@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v24"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v25"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -369,7 +369,14 @@ async function encodePage(page, s){
     if(A.isPhoto || !HAS_DEFLATE || !JB || !s.minGlyph) break;
     bits = new Uint8Array(n);
     for(var t0 = 0; t0 < n; t0++) bits[t0] = A.lum[t0] <= A.thr ? 1 : 0;
-    glyph = JB.textSizePx(bits, w, h);
+    // The text-size measure is a flood fill of the whole page; the size
+    // search renders the same sample pages at many levels, so measure each
+    // page once and scale the score with the resolution (it grows a touch
+    // slower than linearly, hence the 0.9) - re-measured only after a bump.
+    if(px >= LONG_MAX) break;                                  // cannot be made any larger anyway
+    var cache = page._hcGlyph;
+    if(cache && pass === 0) glyph = cache.px === px ? cache.g : Math.floor(cache.g * Math.pow(px / cache.px, 0.9));
+    else { glyph = JB.textSizePx(bits, w, h); page._hcGlyph = { px: px, g: glyph }; }
     // Small print: render again, larger, until the letters are big enough to
     // read (two tries at most - the measure grows a little slower than the
     // scale, so aim 10% past the mark).
