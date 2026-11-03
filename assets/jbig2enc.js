@@ -255,6 +255,32 @@ function components(bits, W, H){
   }
   return out;
 }
+// How big is the text on this bitmap, in pixels? The 60th percentile of the
+// larger side of every text-like connected component (specks and rules
+// excluded). Orientation-independent, so a landscape table scanned sideways
+// measures the same as upright text. ~10 px is the smallest size that reads
+// cleanly in 1-bit; 7 px (a 1050 px A4 page) visibly breaks small print.
+function textSizePx(bits, W, H){
+  var seen = new Uint8Array(W * H), stack = new Int32Array(W * H), sizes = [], sp;
+  for(var i = 0; i < W * H; i++){
+    if(!bits[i] || seen[i]) continue;
+    var x0 = W, y0 = H, x1 = -1, y1 = -1, n = 0;
+    sp = 0; stack[sp++] = i; seen[i] = 1;
+    while(sp){
+      var p = stack[--sp], x = p % W, y = (p - x) / W; n++;
+      if(x < x0) x0 = x; if(x > x1) x1 = x; if(y < y0) y0 = y; if(y > y1) y1 = y;
+      for(var dy = -1; dy <= 1; dy++){ var yy = y + dy; if(yy < 0 || yy >= H) continue;
+        for(var dx = -1; dx <= 1; dx++){ var xx = x + dx; if(xx < 0 || xx >= W) continue;
+          var q = yy * W + xx; if(bits[q] && !seen[q]){ seen[q] = 1; stack[sp++] = q; } } }
+    }
+    var w = x1 - x0 + 1, h = y1 - y0 + 1, mx = Math.max(w, h), mn = Math.min(w, h);
+    if(n < 4 || mx < 2 || mx > 80 || mx > 4 * mn) continue;   // speck, rule, or a big graphic
+    sizes.push(mx);
+  }
+  if(sizes.length < 20) return 0;                               // not a text page - nothing to size
+  sizes.sort(function(u, v){ return u - v; });
+  return sizes[Math.min(sizes.length - 1, Math.floor(sizes.length * 0.6))];
+}
 var NB4 = [[1,0],[-1,0],[0,1],[0,-1]];
 // Number of enclosed white regions (holes): 4-connected background not
 // touching the bbox border. A 6 has one, an 8 two, a 3 none.
@@ -432,7 +458,7 @@ function buildGenericPage(bits, W, H){
 
 return {
   MQEncoder: MQEncoder, Contexts: Contexts, encodeInt: encodeInt, encodeIAID: encodeIAID, encodeGeneric: encodeGeneric,
-  components: components, holeCount: holeCount, xorStats: xorStats, Dictionary: Dictionary, analysePage: analysePage,
+  components: components, textSizePx: textSizePx, holeCount: holeCount, xorStats: xorStats, Dictionary: Dictionary, analysePage: analysePage,
   buildGlobals: buildGlobals, buildPage: buildPage, buildGenericPage: buildGenericPage,
   symbolDictionarySegment: symbolDictionarySegment, textRegionSegment: textRegionSegment, genericRegionSegment: genericRegionSegment, pageInfoSegment: pageInfoSegment
 };

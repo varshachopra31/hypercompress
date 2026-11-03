@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v22"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v23"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -111,12 +111,18 @@ function wireUI(){
 var LONG_MIN = 450, LONG_MAX = 2400;
 var READABLE_PX = 1050;  // ~90 DPI on A4 — below this, small 1-bit text starts to break up
 var READABLE_FLOOR_LEVEL = (READABLE_PX - LONG_MIN) / (LONG_MAX - LONG_MIN);
+// The floor is really a LETTER size, not a page width: a page of small print
+// (a landscape financial table at 6-7 pt) needs more pixels than a page of
+// body text to read equally well. Every page is rendered large enough that
+// its text measures at least this many pixels (see textSizePx), up to LONG_MAX.
+var MIN_GLYPH_PX = 10;
 
 function levelToSettings(level){
   level = Math.max(0, Math.min(1, level));
   return {
     longPx: Math.round(LONG_MIN + level * (LONG_MAX - LONG_MIN)),
     quality: 0.45 + level * 0.45,   // photo pages only: 0.45 -> 0.90
+    minGlyph: MIN_GLYPH_PX,
     grayscale: !!state.allowGray
   };
 }
@@ -235,7 +241,7 @@ function runCompression(target, meta){
   });
 }
 
-function setProgress(pct, label){
+function setProgress0(pct, label){
   state.progress = pct;
   $("#progressBar").style.width = pct + "%";
   $("#progressLabel").textContent = label || (Math.round(pct) + "%");
@@ -303,7 +309,7 @@ function otsuThreshold(hist, total){
 async function renderPage(page, longPx){
   var base = page.getViewport({ scale: 1 });
   var longPt = Math.max(base.width, base.height) || 1;
-  var scale = Math.min(longPx / longPt, 2);
+  var scale = Math.min(longPx / longPt, 3);
   var vp = page.getViewport({ scale: scale });
   var canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.round(vp.width));
@@ -354,42 +360,24 @@ function analyseLuma(d, n){
 }
 
 async function encodePage(page, s){
-  var r = await renderPage(page, s.longPx);
-  var w = r.w, h = r.h, n = w * h;
-  var img = r.ctx.getImageData(0, 0, w, h), d = img.data;
-  var hist = new Uint32Array(256), lum = new Uint8Array(n);
-  for(var i = 0, p = 0; i < n; i++, p += 4){
-    var v = (d[p] * 77 + d[p + 1] * 151 + d[p + 2] * 28) >> 8;
-    lum[i] = v; hist[v]++;
+  var px = s.longPx, r, w, h, n, img, d, A, bits = null, glyph = 0;
+  for(var pass = 0; ; pass++){
+    r = await renderPage(page, px);
+    w = r.w; h = r.h; n = w * h;
+    img = r.ctx.getImageData(0, 0, w, h); d = img.data;
+    A = analyseLuma(d, n);
+    if(A.isPhoto || !HAS_DEFLATE || !JB || !s.minGlyph) break;
+    bits = new Uint8Array(n);
+    for(var t0 = 0; t0 < n; t0++) bits[t0] = A.lum[t0] <= A.thr ? 1 : 0;
+    glyph = JB.textSizePx(bits, w, h);
+    // Small print: render again, larger, until the letters are big enough to
+    // read (two tries at most - the measure grows a little slower than the
+    // scale, so aim 10% past the mark).
+    if(!glyph || glyph >= s.minGlyph || px >= LONG_MAX || pass >= 2) break;
+    px = Math.min(LONG_MAX, Math.ceil(px * s.minGlyph / glyph * 1.1));
+    r.canvas.width = 1; r.canvas.height = 1; bits = null;
   }
-  // Threshold selection, shading-aware. A plain text page splits cleanly into
-  // ink vs paper. A page with shaded cells or header bands has THREE classes
-  // (ink, shade, paper) and a single Otsu cut can land on either side of the
-  // shade. Text always contrasts with what it sits on, so the shade's own
-  // brightness says which way to cut: a LIGHT shade carries dark text — cut
-  // below it so it drops to white; a DARK band carries light text — keep it
-  // black so that text survives as white-on-black.
-  var thr = otsuThreshold(hist, n);
-  var dark = 0;
-  for(var b0 = 0; b0 <= thr; b0++) dark += hist[b0];
-  if(dark / n > 0.12){                       // too much "ink" to be text alone → shading present
-    var sub = new Uint32Array(256);
-    for(var c0 = 0; c0 <= thr; c0++) sub[c0] = hist[c0];
-    var thr2 = otsuThreshold(sub, dark);     // split the dark class into ink vs shade
-    var bandN = 0, bandSum = 0, ink2 = 0;
-    for(var m = 0; m <= thr; m++){
-      if(m <= thr2) ink2 += hist[m]; else { bandN += hist[m]; bandSum += m * hist[m]; }
-    }
-    var bandMean = bandN ? bandSum / bandN : 0;
-    if(bandMean > 128 && ink2 / n >= 0.003) thr = thr2;   // light shade → drop it, keep the dark text
-  }
-  var near = 0, ink = 0;
-  for(var q = Math.max(0, thr - 24); q <= Math.min(255, thr + 24); q++) near += hist[q];
-  for(var b = 0; b <= thr; b++) ink += hist[b];
-  // Photos put many pixels right at the threshold. A page more than half
-  // black is a failed binarisation (or a photo) — keep those as JPEG.
-  var isPhoto = (near / n) > 0.12 || (ink / n) > 0.5;
-
+  var lum = A.lum, thr = A.thr, isPhoto = A.isPhoto, ink = A.ink;
   if(isPhoto || !HAS_DEFLATE){
     if(s.grayscale){
       for(var j = 0, pp = 0; j < n; j++, pp += 4){ d[pp] = d[pp + 1] = d[pp + 2] = lum[j]; }
@@ -398,7 +386,7 @@ async function encodePage(page, s){
     var blob = await new Promise(function(res){ r.canvas.toBlob(function(b){ res(b); }, "image/jpeg", s.quality); });
     r.canvas.width = 1; r.canvas.height = 1;
     var jp = new Uint8Array(await blob.arrayBuffer());
-    return { kind: "jpeg", data: jp, bytes: jp.length, thr: thr, ink: ink / n };
+    return { kind: "jpeg", data: jp, bytes: jp.length, thr: thr, ink: ink, longPx: px };
   }
 
   r.canvas.width = 1; r.canvas.height = 1;
@@ -406,10 +394,9 @@ async function encodePage(page, s){
     // 1 = ink bitmap for the JBIG2 encoder; its final size is only known once
     // the page is analysed, so bytes is the generic-region cost (the upper
     // bound of what we will store - symbol coding can only make it smaller).
-    var bits = new Uint8Array(n);
-    for(var t = 0; t < n; t++) bits[t] = lum[t] <= thr ? 1 : 0;
+    if(!bits){ bits = new Uint8Array(n); for(var t = 0; t < n; t++) bits[t] = lum[t] <= thr ? 1 : 0; }
     var genSeg = JB.genericRegionSegment(2, bits, w, h);
-    return { kind: "jbig2", bits: bits, genSeg: genSeg, width: w, height: h, bytes: genSeg.length + 60, thr: thr, ink: ink / n };
+    return { kind: "jbig2", bits: bits, genSeg: genSeg, width: w, height: h, bytes: genSeg.length + 60, thr: thr, ink: ink, longPx: px, glyph: glyph };
   }
   // Fallback without the JBIG2 module: pack to 1 bit per pixel, rows padded
   // to a byte; 1 = white, 0 = ink; stored with deflate.
@@ -421,7 +408,7 @@ async function encodePage(page, s){
     }
   }
   var def = await deflateBytes(packed);
-  return { kind: "bilevel", data: def, width: w, height: h, bytes: def.length, thr: thr, ink: ink / n };
+  return { kind: "bilevel", data: def, width: w, height: h, bytes: def.length, thr: thr, ink: ink, longPx: px };
 }
 
 // Place a 1-bit deflated bitmap on a pdf-lib page as a true 1-bpc image
@@ -490,7 +477,7 @@ function samplePageList(){
 
 // Estimate the full output size at a quality level by compressing a few
 // representative pages and extrapolating across the whole document.
-async function estimateTotal(level, samples){
+async function estimateTotal(level, samples, corr){
   var s = levelToSettings(level);
   var sum = 0;
   for(var k = 0; k < samples.length; k++){
@@ -500,13 +487,15 @@ async function estimateTotal(level, samples){
   }
   var avg = sum / samples.length;
   // Image payload dominates; add ~3% PDF structural overhead + a small base.
-  return Math.round(avg * state.pageCount * 1.03 + 1500 + state.pageCount * 40);
+  // state.estScale: calibration knob for testing the closed loop (default 1).
+  return Math.round((avg * state.pageCount * 1.03 + 1500 + state.pageCount * 40) * (corr || 1) * (state.estScale || 1));
 }
 
 // Binary-search the highest (best-quality) level whose estimated size fits the
 // target. If even the most aggressive floor can't reach the target, we still
 // return the floor (the smallest we can make it) rather than giving up.
-async function findLevel(target){
+async function findLevel(target, corr){
+  corr = corr || 1;
   var samples = samplePageList();
   var aim = target * 0.95; // margin so the real pass rarely overshoots
 
@@ -514,29 +503,55 @@ async function findLevel(target){
   // smaller pages than that is answered with the smallest readable file and an
   // honest message, not with smudged text that hits the number.
   setProgress(5, "Analysing the document...");
-  var estFloor = await estimateTotal(READABLE_FLOOR_LEVEL, samples);
+  var estFloor = await estimateTotal(READABLE_FLOOR_LEVEL, samples, corr);
   if(estFloor > target){
-    return { level: READABLE_FLOOR_LEVEL, reachable: false, belowReadable: false, floorEstimate: estFloor, textMode: HAS_OCR };
+    return { level: READABLE_FLOOR_LEVEL, reachable: false, belowReadable: false, floorEstimate: estFloor, estimate: estFloor, textMode: HAS_OCR };
   }
   setProgress(12, "Finding the best quality for your target...");
-  var estTop = await estimateTotal(1, samples);
+  var estTop = await estimateTotal(1, samples, corr);
   if(estTop <= aim){
-    return { level: 1, reachable: true, belowReadable: false };
+    return { level: 1, reachable: true, belowReadable: false, estimate: estTop };
   }
 
-  var lo = READABLE_FLOOR_LEVEL, hi = 1, best = READABLE_FLOOR_LEVEL;
+  var lo = READABLE_FLOOR_LEVEL, hi = 1, best = READABLE_FLOOR_LEVEL, bestEst = estFloor;
   for(var it = 0; it < 7; it++){
     var mid = (lo + hi) / 2;
     setProgress(14 + it * 3, "Finding the best quality for your target...");
-    var est = await estimateTotal(mid, samples);
-    if(est <= aim){ best = mid; lo = mid; } else { hi = mid; }
+    var est = await estimateTotal(mid, samples, corr);
+    if(est <= aim){ best = mid; bestEst = est; lo = mid; } else { hi = mid; }
   }
-  return { level: best, reachable: true, belowReadable: false };
+  return { level: best, reachable: true, belowReadable: false, estimate: bestEst };
 }
 
+// The estimate comes from a few sample pages coded as plain bitmaps; the real
+// pass shares one glyph dictionary across the whole document and can come out
+// far smaller (a 3.5 MB target once produced 1.3 MB). So: run, measure, and
+// if the result leaves a big part of the budget unused (or overshoots it),
+// recalibrate the estimate by the measured ratio and run again at the level
+// the budget really pays for. At most two re-runs.
+function setProgress(p, label){ return setProgress0(p, passPrefix && label ? passPrefix + label : label); }
+var passPrefix = "";
 async function compressToTarget(target){
-  var search = await findLevel(target);
-  if(search.textMode) return textModeCompress(target, search);
+  var corr = 1, result = null, best = null;
+  for(var attempt = 0; attempt < 3; attempt++){
+    passPrefix = attempt ? "Pass " + (attempt + 1) + " - using your full size budget. " : "";
+    var search = await findLevel(target, corr);
+    if(search.textMode){ passPrefix = ""; return textModeCompress(target, search); }
+    result = await compressPass(target, search);
+    var actual = result.blob.size, est = search.estimate || actual;
+    if(!best || (actual <= target && (best.blob.size > target || result.level > best.level)) || (best.blob.size > target && actual < best.blob.size)) best = result;
+    var under = actual < target * 0.8 && search.level < 1 - 1e-6;
+    var over = actual > target && search.level > READABLE_FLOOR_LEVEL + 1e-6;
+    if(!(under || over) || attempt === 2 || !(est > 0)) break;
+    corr *= actual / est;
+    console.info("HyperCompress: pass " + (attempt + 1) + " produced " + actual + " bytes against an estimate of " + est + " - re-running at the level the target pays for (calibration x" + corr.toFixed(2) + ")");
+  }
+  passPrefix = "";
+  setProgress(100, "Done!");                   // drop the "Pass N" prefix from the final label
+  return best || result;
+}
+
+async function compressPass(target, search){
   var s = levelToSettings(search.level);
   var pdf = state.pdf;
   var totalPages = pdf.numPages;
@@ -677,6 +692,7 @@ async function textModeCompress(target, search){
     var bits = new Uint8Array(n);
     for(var t = 0; t < n; t++) bits[t] = A.lum[t] <= A.thr ? 1 : 0;
     job.bits = bits;
+    job.glyph = JB.textSizePx(bits, w, h);     // how small the print is, at the OCR resolution
     job.ocr = ocr.recognize(r.canvas).then(function(res){ r.canvas.width = 1; r.canvas.height = 1; return res; }, function(err){ r.canvas.width = 1; r.canvas.height = 1; throw err; });
     return job;
   }
@@ -696,7 +712,13 @@ async function textModeCompress(target, search){
     var ver = HCT.verifyWords(res.data, job.bits, w, h);
     var accepted = ver.words.filter(function(wd){ try { (wd.bold ? fontB : fontR).encodeText(wd.text); return true; } catch(e){ return false; } });
     tot.words += ver.stats.words; tot.accepted += accepted.length; tot.rejConf += ver.stats.rejConf; tot.rejShape += ver.stats.rejShape; tot.rejDigit += ver.stats.rejDigit; tot.rejPunct += ver.stats.rejPunct || 0;
-    var outW = Math.max(1, Math.round(w * s.longPx / Math.max(w, h))), outH = Math.max(1, Math.round(h * s.longPx / Math.max(w, h)));
+    // Leftover pixels (unverified words, rules, seals) are kept at the
+    // readable floor - raised for small print so its letters still measure
+    // MIN_GLYPH_PX, up to the OCR resolution itself.
+    var srcLong = Math.max(w, h), outLong = s.longPx;
+    if(job.glyph && job.glyph < MIN_GLYPH_PX) outLong = Math.max(outLong, Math.ceil(srcLong * MIN_GLYPH_PX / job.glyph * 1.1));
+    outLong = Math.min(srcLong, outLong);
+    var outW = Math.max(1, Math.round(w * outLong / srcLong)), outH = Math.max(1, Math.round(h * outLong / srcLong));
     var resid = HCT.residualBitmap(job.bits, w, h, accepted, outW, outH);
     job.bits = null;
     outPage = outDoc.addPage([origVP.width, origVP.height]);
