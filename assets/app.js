@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v12"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v13"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -250,6 +250,17 @@ function setProgress(pct, label){
 // detected and kept as JPEG at a sane quality.
 
 var HAS_DEFLATE = typeof CompressionStream !== "undefined";
+
+// Yield to the event loop WITHOUT a timer: Chrome throttles setTimeout in a
+// background tab to once a minute after five minutes, which turned a 3-minute
+// run into a 30-minute crawl when the user switched tabs. A MessageChannel
+// task is not throttled, so a long run keeps full speed in the background.
+function yieldNow(){
+  return new Promise(function(r){
+    if(typeof MessageChannel === "undefined"){ setTimeout(r, 0); return; }
+    var ch = new MessageChannel(); ch.port1.onmessage = function(){ r(); }; ch.port2.postMessage(0);
+  });
+}
 // JBIG2 (our own encoder, jbig2enc.js): the codec built for scanned text.
 // Every PDF viewer decodes it; a page costs roughly a third of deflate.
 var JB = window.JBIG2 || null;
@@ -515,7 +526,7 @@ async function compressToTarget(target){
     // exhausts memory, so release each page's decoded resources at once.
     if(page) page.cleanup();
     if(i % 50 === 0){ try { await pdf.cleanup(); } catch(e){} }
-    if(i % 3 === 0){ await new Promise(function(r){ setTimeout(r, 0); }); }
+    if(i % 3 === 0){ await yieldNow(); }
   }
 
   // PASS 2 - write the shared dictionary once, then each page. A page is
@@ -524,7 +535,7 @@ async function compressToTarget(target){
   var G = null, globalsRef = null, perSym = 0, symPages = 0, genPages = 0;
   if(dict && dict.syms.length){
     setProgress(81, "Building the shared glyph dictionary (" + dict.syms.length + " shapes)...");
-    await new Promise(function(r){ setTimeout(r, 0); });
+    await yieldNow();
     G = JB.buildGlobals(dict, 1);                     // measured: one-offs are cheaper in the dictionary than drawn in place
     if(G.numSyms){ globalsRef = outDoc.context.register(PDFLib.PDFRawStream.of(outDoc.context.obj({}), G.globals)); }
     perSym = G.numSyms ? G.globals.length / totalPages : 0;   // dictionary cost shared evenly by the pages
@@ -559,7 +570,7 @@ async function compressToTarget(target){
       outPage.drawImage(img, { x: 0, y: 0, width: it.w, height: it.h });
     }
     plan[j] = null;
-    if(j % 10 === 0){ await new Promise(function(r){ setTimeout(r, 0); }); }
+    if(j % 10 === 0){ await yieldNow(); }
   }
   if(copied) console.warn("HyperCompress: " + copied + " page(s) were copied from the original unchanged.");
   console.info("HyperCompress: " + symPages + " symbol-coded page(s), " + genPages + " bitmap-coded, dictionary " + (G ? G.numSyms + " shapes / " + Math.round(G.globals.length / 1024) + " KB" : "none"));
