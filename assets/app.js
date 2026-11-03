@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v23"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v24"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -538,6 +538,7 @@ async function compressToTarget(target){
     var search = await findLevel(target, corr);
     if(search.textMode){ passPrefix = ""; return textModeCompress(target, search); }
     result = await compressPass(target, search);
+    result.passes = attempt + 1;
     var actual = result.blob.size, est = search.estimate || actual;
     if(!best || (actual <= target && (best.blob.size > target || result.level > best.level)) || (best.blob.size > target && actual < best.blob.size)) best = result;
     var under = actual < target * 0.8 && search.level < 1 - 1e-6;
@@ -836,9 +837,17 @@ function showResult(blob, meta){
   var softNote = " The resolution was lowered to reach this size, so the text is softer — raise the target a little if you want it crisper.";
 
   if(compSize <= target && !meta.belowReadable){
+    // Well under the target? Say why, so a 3 MB target that yields 1.9 MB is
+    // not read as unused budget: at the top level every page is already at
+    // the maximum resolution, and a bigger target cannot buy anything more.
+    var slack = "";
+    if(!auto && target && compSize < target * 0.8){
+      if(meta.level >= 1 - 1e-6) slack = " This is the full-quality version — every page is stored at the maximum resolution (" + ((meta.settings && meta.settings.longPx) || LONG_MAX) + " px on its long side), so a larger target would not change it.";
+      else slack = " The engine ran " + (meta.passes || 1) + " pass" + ((meta.passes || 1) > 1 ? "es" : "") + " to use as much of your target as its size estimate allowed.";
+    }
     opts = {
-      title: auto ? "Compressed — " + auto : "Compressed to your target",
-      note: "Done — now " + fmtSize(compSize) + " (" + pct + "% smaller)" + (auto ? ", with the text kept sharp." : ", under your " + fmtSize(target) + " target, with the text kept sharp."),
+      title: auto ? "Compressed — " + auto : (slack && meta.level >= 1 - 1e-6 ? "Compressed — full quality" : "Compressed to your target"),
+      note: "Done — now " + fmtSize(compSize) + " (" + pct + "% smaller)" + (auto ? ", with the text kept sharp." : ", under your " + fmtSize(target) + " target, with the text kept sharp.") + slack,
       reduction: pct + "% smaller"
     };
   } else if(compSize <= target && meta.belowReadable){
