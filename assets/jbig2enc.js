@@ -305,6 +305,11 @@ function Dictionary(opts){
   this.maxFrac = opts.maxFrac || 0.08;      // largest fraction of differing pixels
   this.exactBelow = opts.exactBelow || 24;  // glyphs with fewer pixels than this: exact only
   this.boxTol = opts.boxTol || 1;           // allowed box-size jitter in pixels
+  // DEFAULT IS EXACT-ONLY. Measured on real scans at ~100 dpi: even an 8% /
+  // 2-pixel-blob tolerance let an n become a u and a t lose its bar on the
+  // 5-7 px lower-case glyphs. A substitution engine is only safe when the
+  // replacement is pixel-identical, so tolerant matching must be opted into.
+  this.exactOnly = opts.exactOnly !== false;
   this.syms = []; this.buckets = {};
 }
 // Compare prototype s and candidate c inside their union box, trying the few
@@ -327,7 +332,7 @@ function alignedXor(s, c, limitBlob, limitCount){
 }
 Dictionary.prototype.match = function(c){
   var area = c.w * c.h, holes = holeCount(c.bm, c.w, c.h);
-  var exact = area < this.exactBelow, limitCount = exact ? 0 : Math.max(2, Math.round(area * this.maxFrac));
+  var exact = this.exactOnly || area < this.exactBelow, limitCount = exact ? 0 : Math.max(2, Math.round(area * this.maxFrac));
   var dws = [0], dhs = [0];
   if(!exact){ for(var t = 1; t <= this.boxTol; t++){ dws.push(-t, t); dhs.push(-t, t); } }
   for(var a = 0; a < dws.length; a++) for(var b = 0; b < dhs.length; b++){
@@ -378,13 +383,18 @@ function analysePage(bits, W, H, dict, opts){
 // -- Document assembly -------------------------------------------------------
 // Finalise: order the dictionary by height class (the id space the text
 // regions must use), build the globals stream, then each page's stream.
-function buildGlobals(dict){
-  var order = dict.syms.map(function(s, i){ return i; });
+// minUses: a shape used fewer times than this stays OUT of the dictionary
+// (remap -1) and is drawn in place by buildPage - cheaper for one-offs, and
+// it keeps the symbol id code short for everything else.
+function buildGlobals(dict, minUses){
+  minUses = minUses || 1;
+  var order = [];
+  for(var i = 0; i < dict.syms.length; i++) if(dict.syms[i].uses >= minUses) order.push(i);
   order.sort(function(a, b){ var A = dict.syms[a], B = dict.syms[b]; return A.h - B.h || A.w - B.w || a - b; });
-  var remap = new Int32Array(order.length), sorted = [];
+  var remap = new Int32Array(dict.syms.length).fill(-1), sorted = [];
   for(var k = 0; k < order.length; k++){ remap[order[k]] = k; sorted.push(dict.syms[order[k]]); }
   var seg = sorted.length ? symbolDictionarySegment(0, sorted) : null;
-  return { globals: seg, remap: remap, numSyms: sorted.length };
+  return { globals: seg, remap: remap, numSyms: sorted.length, dict: dict };
 }
 function concat(parts){
   var total = 0, k; for(k = 0; k < parts.length; k++) total += parts[k].length;
@@ -393,11 +403,22 @@ function concat(parts){
   return out;
 }
 function buildPage(W, H, analysis, globals){
-  var parts = [pageInfoSegment(1, W, H)], q = analysis.quads;
-  if(q.length && globals.numSyms){
-    var ins = new Int32Array(q.length);
-    for(var k = 0; k < q.length; k += 4){ ins[k] = globals.remap[q[k]]; ins[k + 1] = q[k + 1]; ins[k + 2] = q[k + 2]; ins[k + 3] = q[k + 3]; }
+  var parts = [pageInfoSegment(1, W, H)], q = analysis.quads, k;
+  var nIn = 0; for(k = 0; k < q.length; k += 4) if(globals.remap[q[k]] >= 0) nIn++;
+  if(nIn && globals.numSyms){
+    var ins = new Int32Array(nIn * 4), p = 0;
+    for(k = 0; k < q.length; k += 4){ var id = globals.remap[q[k]]; if(id < 0) continue; ins[p++] = id; ins[p++] = q[k + 1]; ins[p++] = q[k + 2]; ins[p++] = q[k + 3]; }
     parts.push(textRegionSegment(2, 0, W, H, ins, globals.numSyms));
+  }
+  if(nIn * 4 < q.length){                           // one-off shapes drawn in place
+    var bm = new Uint8Array(W * H), syms = globals.dict.syms;
+    for(k = 0; k < q.length; k += 4){
+      if(globals.remap[q[k]] >= 0) continue;
+      var sy = syms[q[k]], x0 = q[k + 1], y0 = q[k + 2];
+      for(var y = 0; y < sy.h; y++){ var yy = y0 + y; if(yy < 0 || yy >= H) continue;
+        for(var x = 0; x < sy.w; x++){ var xx = x0 + x; if(xx >= 0 && xx < W && sy.bm[y * sy.w + x]) bm[yy * W + xx] = 1; } }
+    }
+    parts.push(genericRegionSegment(4, bm, W, H));
   }
   if(analysis.residualSeg) parts.push(analysis.residualSeg);
   return concat(parts);

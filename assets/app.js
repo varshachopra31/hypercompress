@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v11"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v12"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -489,7 +489,7 @@ async function compressToTarget(target){
   // into glyphs that go into ONE dictionary shared by the whole document
   // (every distinct letter shape is stored once), plus a per-page list of
   // where each glyph sits. Only the compact results are kept per page.
-  var dict = JB ? new JB.Dictionary() : null;
+  var dict = JB ? new JB.Dictionary({ exactOnly: true }) : null;
   var plan = new Array(totalPages);
   for(var i = 1; i <= totalPages; i++){
     setProgress(35 + (i - 1) / totalPages * 45, "Reading page " + i + " of " + totalPages + "...");
@@ -525,9 +525,9 @@ async function compressToTarget(target){
   if(dict && dict.syms.length){
     setProgress(81, "Building the shared glyph dictionary (" + dict.syms.length + " shapes)...");
     await new Promise(function(r){ setTimeout(r, 0); });
-    G = JB.buildGlobals(dict);
-    globalsRef = outDoc.context.register(PDFLib.PDFRawStream.of(outDoc.context.obj({}), G.globals));
-    perSym = G.globals.length / G.numSyms;
+    G = JB.buildGlobals(dict, 1);                     // measured: one-offs are cheaper in the dictionary than drawn in place
+    if(G.numSyms){ globalsRef = outDoc.context.register(PDFLib.PDFRawStream.of(outDoc.context.obj({}), G.globals)); }
+    perSym = G.numSyms ? G.globals.length / totalPages : 0;   // dictionary cost shared evenly by the pages
   }
   for(var j = 0; j < totalPages; j++){
     setProgress(82 + j / totalPages * 15, "Writing page " + (j + 1) + " of " + totalPages + "...");
@@ -541,12 +541,11 @@ async function compressToTarget(target){
     var outPage = outDoc.addPage([it.w, it.h]), e = it.enc;
     if(e.kind === "jbig2"){
       var stream = null;
+      var useGlobals = false;
       if(G && it.an.quads.length){
         var symStream = JB.buildPage(e.width, e.height, it.an, G);
-        var symCost = symStream.length + it.an.newSyms * perSym;
-        if(symCost < e.genSeg.length + 60){ stream = symStream; symPages++; }
+        if(symStream.length + perSym < e.genSeg.length + 60){ stream = symStream; symPages++; useGlobals = G.numSyms > 0; }
       }
-      var useGlobals = !!stream;
       if(!stream){
         var head = JB.pageInfoSegment(1, e.width, e.height);
         stream = new Uint8Array(head.length + e.genSeg.length); stream.set(head, 0); stream.set(e.genSeg, head.length);
