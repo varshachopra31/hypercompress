@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v27"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v28"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -532,6 +532,45 @@ function drawJbig2(doc, outPage, stream, pxW, pxH, w, h, globalsRef, asMask){
   );
 }
 
+// -- Tone rung ---------------------------------------------------------------
+// A photographic scan (one page image per page, no separate text mask) looks
+// harsh as 1-bit black & white: the soft greys of the original are gone. When
+// the target leaves room above the 1-bit top, the pages are instead kept as
+// JPEG at the scan's own resolution - grayscale unless the page has colour -
+// with the quality rising with the budget. t in [0,1] -> quality 0.45..0.92.
+var TONE_Q_MIN = 0.35, TONE_Q_MAX = 0.92;
+function toneQuality(t){ return +(TONE_Q_MIN + Math.max(0, Math.min(1, t)) * (TONE_Q_MAX - TONE_Q_MIN)).toFixed(3); }
+function toneLongPx(){ return Math.min(NATIVE_CAP, Math.max(LONG_MIN, state.nativeLong || LONG_MAX)); }
+function toneAvailable(){ return !!(state.nativeInfo && state.nativeInfo.kind === "image" && state.nativeLong > 0); }
+async function encodeTone(page, t){
+  var r = await renderPage(page, toneLongPx());
+  var w = r.w, h = r.h, n = w * h;
+  var img = r.ctx.getImageData(0, 0, w, h), d = img.data;
+  // colour page? (sampled: a page with a coloured stamp or signature keeps its colour)
+  var sat = 0, cnt = 0;
+  for(var i = 0; i < n; i += 7){ var p = i * 4, mx = Math.max(d[p], d[p + 1], d[p + 2]), mn = Math.min(d[p], d[p + 1], d[p + 2]); cnt++; if(mx - mn > 48 && mx > 60) sat++; }
+  var color = sat / cnt > 0.004;
+  if(!color){
+    for(var j = 0, q = 0; j < n; j++, q += 4){ var v = (d[q] * 77 + d[q + 1] * 151 + d[q + 2] * 28) >> 8; d[q] = d[q + 1] = d[q + 2] = v; }
+    r.ctx.putImageData(img, 0, 0);
+  }
+  var quality = toneQuality(t);
+  var blob = await new Promise(function(res){ r.canvas.toBlob(function(b){ res(b); }, "image/jpeg", quality); });
+  r.canvas.width = 1; r.canvas.height = 1;
+  var jp = new Uint8Array(await blob.arrayBuffer());
+  return { kind: "jpeg", data: jp, bytes: jp.length, width: w, height: h, longPx: Math.max(w, h), tone: true, color: color, quality: quality };
+}
+async function estimateTone(t, samples, corr){
+  var sum = 0;
+  for(var k = 0; k < samples.length; k++){
+    var page = await state.pdf.getPage(samples[k]);
+    sum += (await encodeTone(page, t)).bytes;
+    page.cleanup();
+  }
+  var avg = sum / samples.length;
+  return Math.round((avg * state.pageCount * 1.03 + 1500 + state.pageCount * 40) * (corr || 1) * (state.estScale || 1));
+}
+
 // Spread of sample pages used to estimate the whole-document size cheaply.
 function samplePageList(){
   var n = state.pageCount;
@@ -584,6 +623,28 @@ async function findLevel(target, corr){
   setProgress(12, "Finding the best quality for your target...");
   var estTop = await estimateTotal(1, samples, corr);
   if(estTop <= aim){
+    // The 1-bit ladder's top fits. For a photographic scan, spend what is
+    // left on keeping the scan's own tones (JPEG at native resolution): find
+    // the highest quality whose estimate fits; if even the lowest does not,
+    // stay with 1-bit at full resolution.
+    if(toneAvailable()){
+      setProgress(13, "Checking whether the scan's own tones fit your target...");
+      var estT0 = await estimateTone(0, samples, corr);
+      if(estT0 <= aim){
+        var estT1 = await estimateTone(1, samples, corr);
+        if(estT1 <= aim) return { level: 1, tone: true, reachable: true, belowReadable: false, estimate: estT1 };
+        var tlo = 0, thi = 1, tbest = 0, tbestEst = estT0;
+        for(var ti = 0; ti < 6; ti++){
+          var tmid = (tlo + thi) / 2;
+          setProgress(14 + ti * 3, "Finding the best quality for your target...");
+          var estM = await estimateTone(tmid, samples, corr);
+          if(estM <= aim){ tbest = tmid; tbestEst = estM; tlo = tmid; } else { thi = tmid; }
+        }
+        return { level: tbest, tone: true, reachable: true, belowReadable: false, estimate: tbestEst };
+      }
+      // the tones do not fit: say what they would need, so the user can choose
+      return { level: 1, reachable: true, belowReadable: false, estimate: estTop, toneNeed: estT0 };
+    }
     return { level: 1, reachable: true, belowReadable: false, estimate: estTop };
   }
 
@@ -626,8 +687,10 @@ async function compressToTarget(target){
   return best || result;
 }
 
+var toneSawColor = false;
 async function compressPass(target, search){
   var s = levelToSettings(search.level);
+  toneSawColor = false;
   var pdf = state.pdf;
   var totalPages = pdf.numPages;
   var outDoc = await PDFLib.PDFDocument.create();
@@ -644,8 +707,9 @@ async function compressPass(target, search){
     var page = null;
     try {
       page = await pdf.getPage(i);
-      var enc = await encodePage(page, s);
+      var enc = search.tone ? await encodeTone(page, search.level) : await encodePage(page, s);
       var origVP = page.getViewport({ scale: 1 });
+      if(enc.color) toneSawColor = true;
       var item = { w: origVP.width, h: origVP.height, enc: enc };
       if(enc.kind === "jbig2"){
         item.an = JB.analysePage(enc.bits, enc.width, enc.height, dict);
@@ -733,7 +797,8 @@ async function compressPass(target, search){
     belowReadable: search.belowReadable,
     level: search.level,
     target: target,
-    settings: s
+    settings: s,
+    toneNeed: search.toneNeed || 0, tone: !!search.tone, toneQ: search.tone ? toneQuality(search.level) : 0, toneLongPx: search.tone ? toneLongPx() : 0, toneColor: !!(search.tone && toneSawColor)
   };
 }
 
@@ -882,7 +947,7 @@ function showResult(blob, meta){
   var opts;
   var ni = state.nativeInfo;
   var diag = "Build " + BUILD + " · " + state.pageCount + " pages · scan image " + (ni ? ni.w + "×" + ni.h + " px (" + ni.kind + ")" : "not found") + " · native " + (state.nativeLong || 0) + " px · top " + topPx() + " px"
-    + (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "") + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "");
+    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "");
 
   if(compSize >= origSize){
     // Rasterising this PDF can't beat it even at the most aggressive setting —
@@ -913,13 +978,26 @@ function showResult(blob, meta){
   }
   var softNote = " The resolution was lowered to reach this size, so the text is softer — raise the target a little if you want it crisper.";
 
-  if(compSize <= target && !meta.belowReadable){
+  if(compSize <= target && !meta.belowReadable && meta.tone){
+    var full = meta.level >= 1 - 1e-6, qpct = Math.round(meta.toneQ * 100);
+    opts = {
+      title: full ? "Compressed — full quality" : (auto ? "Compressed — " + auto : "Compressed to your target"),
+      note: "Done — now " + fmtSize(compSize) + " (" + pct + "% smaller)" + (auto ? ". " : ", under your " + fmtSize(target) + " target. ")
+        + "Your target left room to keep the scan's own tones: every page is stored as " + (meta.toneColor ? "colour" : "grayscale") + " JPEG at the scan's native resolution (" + meta.toneLongPx + " px on its long side) at quality " + qpct + "%"
+        + (full ? " — near-lossless, so a larger target would not change it." : ". A larger target buys a higher JPEG quality; a smaller one eventually switches to crisp 1-bit black & white."),
+      reduction: pct + "% smaller"
+    };
+  } else if(compSize <= target && !meta.belowReadable){
     // Well under the target? Say why, so a 3 MB target that yields 1.9 MB is
     // not read as unused budget: at the top level every page is already at
     // the maximum resolution, and a bigger target cannot buy anything more.
     var slack = "";
     if(!auto && target && compSize < target * 0.8){
-      if(meta.level >= 1 - 1e-6) slack = " This is the full-quality version — every page is stored at the maximum resolution (" + ((meta.settings && meta.settings.longPx) || topPx()) + " px on its long side), so a larger target would not change it.";
+      if(meta.level >= 1 - 1e-6){
+        slack = " This is the full-quality version in black & white — every page is stored at the maximum resolution (" + ((meta.settings && meta.settings.longPx) || topPx()) + " px on its long side).";
+        if(meta.toneNeed && meta.toneNeed < origSize) slack += " Keeping the scan’s own grey tones instead would need a target of about " + fmtSize(meta.toneNeed * 1.08) + " — set that and run again if you prefer the original look.";
+        else slack += " A larger target would not change it.";
+      }
       else slack = " The engine ran " + (meta.passes || 1) + " pass" + ((meta.passes || 1) > 1 ? "es" : "") + " to use as much of your target as its size estimate allowed.";
     }
     opts = {
@@ -1027,7 +1105,7 @@ function toast(msg, cls){
 }
 
 // Test hook (same convention as the other dashboards' window.__xbrl / __mca).
-window.__hc = { JB: JB, encodePage: encodePage, nativeLongPx: nativeLongPx, documentTopPx: documentTopPx, floorLevel: floorLevel, topPx: topPx, samplePageList: samplePageList, drawBilevel: drawBilevel, deflateBytes: deflateBytes,
+window.__hc = { JB: JB, encodePage: encodePage, encodeTone: encodeTone, estimateTone: estimateTone, toneQuality: toneQuality, nativeLongPx: nativeLongPx, documentTopPx: documentTopPx, floorLevel: floorLevel, topPx: topPx, samplePageList: samplePageList, drawBilevel: drawBilevel, deflateBytes: deflateBytes,
   otsuThreshold: otsuThreshold, levelToSettings: levelToSettings, state: state };
 
 if(document.readyState === "loading"){
