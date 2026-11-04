@@ -281,6 +281,65 @@ function textSizePx(bits, W, H){
   sizes.sort(function(u, v){ return u - v; });
   return sizes[Math.min(sizes.length - 1, Math.floor(sizes.length * 0.6))];
 }
+// Bounding boxes of the text-like connected components (no per-glyph bitmaps).
+function componentBoxes(bits, W, H){
+  var seen = new Uint8Array(W * H), stack = new Int32Array(W * H), out = [], sp;
+  for(var i = 0; i < W * H; i++){
+    if(!bits[i] || seen[i]) continue;
+    var x0 = W, y0 = H, x1 = -1, y1 = -1, n = 0;
+    sp = 0; stack[sp++] = i; seen[i] = 1;
+    while(sp){
+      var p = stack[--sp], x = p % W, y = (p - x) / W; n++;
+      if(x < x0) x0 = x; if(x > x1) x1 = x; if(y < y0) y0 = y; if(y > y1) y1 = y;
+      for(var dy = -1; dy <= 1; dy++){ var yy = y + dy; if(yy < 0 || yy >= H) continue;
+        for(var dx = -1; dx <= 1; dx++){ var xx = x + dx; if(xx < 0 || xx >= W) continue;
+          var q = yy * W + xx; if(bits[q] && !seen[q]){ seen[q] = 1; stack[sp++] = q; } } }
+    }
+    var w = x1 - x0 + 1, h = y1 - y0 + 1, mx = Math.max(w, h), mn = Math.min(w, h);
+    if(n < 4 || mx < 3 || mx > 80 || mx > 4 * mn + 2) continue;
+    out.push({ x: x0, y: y0, w: w, h: h });
+  }
+  return out;
+}
+// How much of this page is FIGURES? Glyphs are grouped into lines and words;
+// a word of >= 3 glyphs counts as a number when its glyphs are uniform in
+// width (a narrow "1" allowed), share one height, sit in the page's tall
+// glyph class (digits are cap-height, prose is mostly x-height) and, when
+// long, carry comma/point separators. Returns the fraction of glyphs in such
+// words (prose ~0.00-0.01, a balance sheet ~0.1-0.2). Run upright and
+// rotated, so a sideways table scores too.
+function figuresScoreBoxes(cs){
+  if(cs.length < 20) return { f: 0, words: 0, numWords: 0 };
+  var hs = cs.map(function(c){ return c.h; }).sort(function(u, v){ return u - v; }), mh = hs[hs.length >> 1], hc = hs[Math.floor(hs.length * 0.85)];
+  cs.sort(function(u, v){ return (u.y + u.h / 2) - (v.y + v.h / 2); });
+  var lines = [], cur = null;
+  for(var k = 0; k < cs.length; k++){ var c = cs[k], cy = c.y + c.h / 2; if(cur && Math.abs(cy - cur.cy) <= mh * 0.6){ cur.items.push(c); cur.cy = (cur.cy * (cur.items.length - 1) + cy) / cur.items.length; } else { cur = { cy: cy, items: [c] }; lines.push(cur); } }
+  var glyphs = 0, numGlyphs = 0, words = 0, numWords = 0;
+  function med(arr){ var s = arr.slice().sort(function(u, v){ return u - v; }); return s[s.length >> 1]; }
+  for(var li = 0; li < lines.length; li++){
+    var items = lines[li].items; items.sort(function(u, v){ return u.x - v.x; });
+    var word = [items[0]];
+    var flush = function(){
+      var g = word.filter(function(c){ return c.h >= mh * 0.55; }); words++; glyphs += g.length;
+      if(g.length >= 3){
+        var mw = med(g.map(function(c){ return c.w; })), mhh = med(g.map(function(c){ return c.h; }));
+        var okW = g.filter(function(c){ return Math.abs(c.w - mw) <= 0.3 * mw || c.w < 0.6 * mw; }).length / g.length;
+        var okH = g.filter(function(c){ return Math.abs(c.h - mhh) <= 0.12 * mhh; }).length / g.length;
+        var seps = word.length - g.length;
+        if(okW >= 0.8 && okH >= 0.85 && mhh >= 0.85 * hc && mw < mhh * 0.95 && (g.length <= 12 || seps > 0)){ numWords++; numGlyphs += g.length; }
+      }
+    };
+    for(var i = 1; i < items.length; i++){ var pv = items[i - 1], it = items[i]; if(it.x - (pv.x + pv.w) > mh * 0.45){ flush(); word = [it]; } else word.push(it); }
+    flush();
+  }
+  return { f: glyphs ? numGlyphs / glyphs : 0, words: words, numWords: numWords };
+}
+function figuresScore(bits, W, H){
+  var cs = componentBoxes(bits, W, H);
+  var up = figuresScoreBoxes(cs.map(function(c){ return { x: c.x, y: c.y, w: c.w, h: c.h }; }));
+  var rot = figuresScoreBoxes(cs.map(function(c){ return { x: c.y, y: c.x, w: c.h, h: c.w }; }));
+  return (rot.numWords > up.numWords * 1.5 && rot.f > up.f) ? rot.f : up.f;
+}
 var NB4 = [[1,0],[-1,0],[0,1],[0,-1]];
 // Number of enclosed white regions (holes): 4-connected background not
 // touching the bbox border. A 6 has one, an 8 two, a 3 none.
@@ -458,7 +517,7 @@ function buildGenericPage(bits, W, H){
 
 return {
   MQEncoder: MQEncoder, Contexts: Contexts, encodeInt: encodeInt, encodeIAID: encodeIAID, encodeGeneric: encodeGeneric,
-  components: components, textSizePx: textSizePx, holeCount: holeCount, xorStats: xorStats, Dictionary: Dictionary, analysePage: analysePage,
+  components: components, textSizePx: textSizePx, componentBoxes: componentBoxes, figuresScore: figuresScore, holeCount: holeCount, xorStats: xorStats, Dictionary: Dictionary, analysePage: analysePage,
   buildGlobals: buildGlobals, buildPage: buildPage, buildGenericPage: buildGenericPage,
   symbolDictionarySegment: symbolDictionarySegment, textRegionSegment: textRegionSegment, genericRegionSegment: genericRegionSegment, pageInfoSegment: pageInfoSegment
 };
