@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v31"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v32"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -408,7 +408,9 @@ async function renderPage(page, longPx){
   canvas.width = Math.max(1, Math.round(vp.width));
   canvas.height = Math.max(1, Math.round(vp.height));
   var ctx = canvas.getContext("2d");
-  await page.render({ canvasContext: ctx, viewport: vp }).promise;
+  // intent "print": pdf.js then advances the render without requestAnimationFrame,
+  // which browsers pause in a hidden tab/pane - a long run keeps going in the background.
+  await page.render({ canvasContext: ctx, viewport: vp, intent: "print" }).promise;
   return { canvas: canvas, ctx: ctx, w: canvas.width, h: canvas.height };
 }
 
