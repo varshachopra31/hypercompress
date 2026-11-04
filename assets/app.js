@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v36"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v37"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -623,18 +623,23 @@ var TONE_Q_MIN = 0.35, TONE_Q_MAX = 0.92;
 function toneQuality(t){ return +(TONE_Q_MIN + Math.max(0, Math.min(1, t)) * (TONE_Q_MAX - TONE_Q_MIN)).toFixed(3); }
 function toneLongPx(){ return Math.min(NATIVE_CAP, Math.max(LONG_MIN, state.nativeLong || LONG_MAX)); }
 function toneAvailable(){ return !!(state.nativeInfo && state.nativeInfo.kind === "image" && state.nativeLong > 0); }
-// Table pages in the crisp-text rung: m >= 0 -> native resolution, quality
-// toneQuality(m); m < 0 (the lean end) -> lowest quality, long side shrinking
-// towards TABLE_PX_LEAN of native. Paper grain is flattened to white.
-var TABLE_PX_LEAN = 0.75;
-function tablePx(m){ var nat = toneLongPx(); return m >= 0 ? nat : Math.max(READABLE_PX, Math.round(nat * (1 + (1 - TABLE_PX_LEAN) * Math.max(-1, m)))); }
-function tableQuality(m){ return toneQuality(Math.max(0, m)); }
+// Table pages in the crisp-text rung: always native resolution; quality
+// TABLE_Q_MIN..TONE_Q_MAX for m in [0,1]; for m in [-1,0) only the densest
+// fraction (m + 1) stays grayscale. Paper grain is flattened to white.
+// Below TABLE_Q_MIN a grayscale JPEG of small digits reads WORSE than crisp
+// 1-bit (blocking smears the strokes), and below native resolution pixels
+// are simply lost - so neither is ever traded. m in [0,1] -> quality
+// TABLE_Q_MIN..TONE_Q_MAX at native; m in [-1,0) -> only the densest
+// fraction (m + 1) of the table pages stay grayscale, the rest 1-bit.
+var TABLE_Q_MIN = 0.55;
+function tablePx(m){ return toneLongPx(); }
+function tableQuality(m){ return +(TABLE_Q_MIN + Math.max(0, Math.min(1, m)) * (TONE_Q_MAX - TABLE_Q_MIN)).toFixed(3); }
 function tableOpts(m){ return { mrc: true, flatten: true, gray: true, px: tablePx(m), quality: tableQuality(m) }; }
 // Below m = -1 only a FRACTION (m + 2) of the table pages stay grayscale, the
 // densest first (state.figRank, by figures score); the rest are 1-bit.
-function tableFrac(m){ return m >= -1 ? 1 : Math.max(0, m + 2); }
+function tableFrac(m){ return m >= 0 ? 1 : Math.max(0, m + 1); }
 function tableKept(pn, m){
-  if(m >= -1) return true;
+  if(m >= 0) return true;
   var idx = state.figRankIdx ? state.figRankIdx[pn] : null;
   if(idx == null) return false;                      // not ranked (unscanned on a very long document): 1-bit
   return idx < Math.ceil(tableFrac(m) * state.figRank.length);
@@ -758,7 +763,7 @@ function mrcSamples(samples){
 async function estimateMrc(m, samples, corr){
   var sTop = levelToSettings(1), n = state.pageCount, S = mrcSamples(samples);
   var figN = state.figPagesCount != null ? Math.min(n, state.figPagesCount) : Math.round(S.fig.length / Math.max(1, samples.length) * n);
-  figN = Math.round(figN * tableFrac(m));            // below m = -1 only the densest fraction stays grayscale
+  figN = Math.ceil(figN * tableFrac(m));             // below m = 0 only the densest fraction stays grayscale (ceil, exactly as tableKept counts them)
   var proseN = n - figN, figAvg = 0, proseAvg = 0;
   if(figN > 0 && S.fig.length){
     var fs = 0;
@@ -891,14 +896,14 @@ async function findLevel(target, corr){
       // pure 1-bit at full resolution, which is known to fit - so the search
       // always lands somewhere in the rung and the budget is always spent.
       setProgress(13, "Fitting the table pages into your target...");
-      var llo = -2, lhi = 0, lbest = -2, lbestEst = estTop;
+      var llo = -1, lhi = 0, lbest = -1, lbestEst = estTop;
       for(var li = 0; li < 7; li++){
         var lmid = (llo + lhi) / 2;
         setProgress(14 + li * 3, "Finding how much grayscale the table pages can have...");
         var estLL = await estimateMrc(lmid, samples, corr);
         if(estLL <= aim){ lbest = lmid; lbestEst = estLL; llo = lmid; } else { lhi = lmid; }
       }
-      if(lbest <= -2 + 1e-9) return { level: 1, reachable: true, belowReadable: false, estimate: estTop, toneNeed: estM0 };
+      if(lbest <= -1 + 1e-9) return { level: 1, reachable: true, belowReadable: false, estimate: estTop, toneNeed: estM0 };
       return { level: lbest, mrc: true, lean: true, reachable: true, belowReadable: false, estimate: lbestEst };
     }
     return { level: 1, reachable: true, belowReadable: false, estimate: estTop };
@@ -933,7 +938,7 @@ async function compressToTarget(target){
     var actual = result.blob.size, est = search.estimate || actual;
     if(!best || (actual <= target && (best.blob.size > target || result.level > best.level)) || (best.blob.size > target && actual < best.blob.size)) best = result;
     var under = actual < target * 0.9 && search.level < 1 - 1e-6;   // more than 10% of the budget unused -> re-run at the level it pays for
-    var over = actual > target && search.level > (search.mrc ? -2 : (search.tone ? -1 : floorLevel())) + 1e-6;
+    var over = actual > target && search.level > (search.mrc ? -1 : (search.tone ? -1 : floorLevel())) + 1e-6;
     if(!(under || over) || attempt === 2 || !(est > 0)) break;
     var rung = search.tone ? "tone" : (search.mrc ? "mrc" : "bw");
     corr[rung] *= actual / est;
@@ -1255,7 +1260,7 @@ function showResult(blob, meta){
         + (meta.bgOn
           ? "The text is stored crisp in black & white at full resolution, and your target left room to keep the scan’s look underneath it: paper tone, stamps, shading and signatures are kept as a soft " + (meta.toneColor ? "colour" : "grayscale") + " background layer (" + meta.bgPx + " px on its long side, quality " + Math.round(meta.bgQ * 100) + "%)."
           : "Text pages are stored crisp in black & white at full resolution.")
-        + (meta.figTonePages ? " " + meta.figTonePages + " page" + (meta.figTonePages > 1 ? "s" : "") + " of figures " + (meta.figTonePages > 1 ? "were" : "was") + " kept entirely in grayscale" + (meta.level < 0 ? " at " + meta.tablePx + " px on the long side (reduced from the scan’s " + toneLongPx() + " px to meet the target)" : " at the scan’s full resolution") + ", so the digits keep their shading." + (meta.figSkipped ? " The target had no room for all the pages of figures in grayscale, so the " + meta.figSkipped + " least dense " + (meta.figSkipped > 1 ? "were" : "was") + " kept in crisp black & white instead; a larger target takes more of them into grayscale." : "") : "")
+        + (meta.figTonePages ? " " + meta.figTonePages + " page" + (meta.figTonePages > 1 ? "s" : "") + " of figures " + (meta.figTonePages > 1 ? "were" : "was") + " kept entirely in grayscale" + " at the scan’s full resolution (quality " + Math.round((meta.tableQ || 0) * 100) + "%)" + ", so the digits keep their shading." + (meta.figSkipped ? " The target had no room for all the pages of figures in grayscale, so the " + meta.figSkipped + " least dense " + (meta.figSkipped > 1 ? "were" : "was") + " kept in crisp black & white instead; a larger target takes more of them into grayscale." : "") : "")
         + (fullM ? " That is the sharpest background this rung offers; a much larger target would keep whole pages as photographic JPEG instead." : " A larger target sharpens the background; a smaller one eventually drops it and keeps black & white only."),
       reduction: pct + "% smaller"
     };
