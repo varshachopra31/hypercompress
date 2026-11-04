@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v41"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v42"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -1076,11 +1076,31 @@ async function losslessOptimise(){
       for(var w = 0; w < objs.length; w++){ if(!remap[objs[w][0].toString()]) walk(objs[w][1]); if(w % 400 === 399) await yieldNow(); }
       for(var d = 0; d < dupRefs.length; d++) ctx.delete(dupRefs[d]);
     }
+    // 2. compress whatever the file stored uncompressed (content streams as
+    //    plain text are common in generated PDFs) - Flate is lossless
+    var flated = 0, flatedSaved = 0;
+    if(HAS_DEFLATE){
+      setProgress(9, "Compressing streams the file left uncompressed...");
+      var FILTER = PDFLib.PDFName.of("Filter");
+      for(var f2 = 0; f2 < objs.length; f2++){
+        var ref2 = objs[f2][0], o2 = objs[f2][1];
+        if(remap[ref2.toString()] || !(o2 instanceof PDFLib.PDFStream)) continue;
+        if(o2.dict.has(FILTER)) continue;
+        var c2 = null; try { c2 = o2.contents || (o2.getContents && o2.getContents()); } catch(e){ continue; }
+        if(!c2 || c2.length < 128) continue;
+        var def = await deflateBytes(c2);
+        if(def.length < c2.length * 0.95){
+          var nd = o2.dict.clone(ctx); nd.set(FILTER, PDFLib.PDFName.of("FlateDecode"));
+          ctx.assign(ref2, PDFLib.PDFRawStream.of(nd, def)); flated++; flatedSaved += c2.length - def.length;
+        }
+        if(f2 % 100 === 99) await yieldNow();
+      }
+    }
     setProgress(10, "Writing the re-packed PDF...");
     await yieldNow();
     var out = await doc.save({ useObjectStreams: true, addDefaultPage: false, updateFieldAppearances: false });
-    state.lossless = { bytes: out, dup: dup, dupBytes: dupBytes, streams: streams };
-    console.info("HyperCompress: lossless re-pack " + state.originalSize + " -> " + out.length + " bytes (" + dup + " duplicate stream(s), " + dupBytes + " bytes, removed)");
+    state.lossless = { bytes: out, dup: dup, dupBytes: dupBytes, streams: streams, flated: flated, flatedSaved: flatedSaved };
+    console.info("HyperCompress: lossless re-pack " + state.originalSize + " -> " + out.length + " bytes (" + dup + " duplicate stream(s) / " + dupBytes + " bytes removed; " + flated + " uncompressed stream(s) deflated, " + flatedSaved + " bytes saved)");
   } catch(err){ console.warn("HyperCompress: lossless re-pack failed", err); state.lossless = null; }
   return state.lossless;
 }
@@ -1400,7 +1420,7 @@ function showResult(blob, meta){
   var opts;
   var ni = state.nativeInfo;
   var diag = "Build " + BUILD + " · " + state.pageCount + " pages · scan image " + (ni ? ni.w + "×" + ni.h + " px (" + ni.kind + ")" : "not found") + " · native " + (state.nativeLong || 0) + " px · top " + topPx() + " px"
-    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG q" + (meta.tableQ || 0).toFixed(2) + " @ " + meta.tablePx + " px" + (meta.figSkipped ? " (" + meta.figSkipped + " more as 1-bit)" : "") : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "") + (state.figPagesCount != null ? " · table pages " + state.figPagesCount + "/" + state.pageCount : "") + (photoScan() ? " · sharpened before threshold" : "") + (meta.fragTotal ? " · fine-print pages kept as scanned " + (meta.kept || 0) + "/" + meta.fragTotal : "") + (lowDpiPhotoScan() ? " · low-dpi scan: grayscale rung off" : "") + (meta.native ? " · native PDF (no page image)" : "") + (meta.lossless ? " · lossless re-pack: " + meta.lossless.dup + " duplicate stream(s) of " + meta.lossless.streams + " removed" : "");
+    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG q" + (meta.tableQ || 0).toFixed(2) + " @ " + meta.tablePx + " px" + (meta.figSkipped ? " (" + meta.figSkipped + " more as 1-bit)" : "") : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "") + (state.figPagesCount != null ? " · table pages " + state.figPagesCount + "/" + state.pageCount : "") + (photoScan() ? " · sharpened before threshold" : "") + (meta.fragTotal ? " · fine-print pages kept as scanned " + (meta.kept || 0) + "/" + meta.fragTotal : "") + (lowDpiPhotoScan() ? " · low-dpi scan: grayscale rung off" : "") + (meta.native ? " · native PDF (no page image)" : "") + (meta.lossless ? " · lossless re-pack: " + meta.lossless.dup + " duplicate stream(s) of " + meta.lossless.streams + " removed, " + (meta.lossless.flated || 0) + " uncompressed stream(s) deflated" : "");
 
   if(compSize >= origSize){
     // Rasterising this PDF can't beat it even at the most aggressive setting —
@@ -1436,7 +1456,9 @@ function showResult(blob, meta){
     opts = {
       title: underL ? "Compressed — losslessly" : "Smallest without turning text into pictures — " + fmtSize(compSize),
       note: "This PDF is a native document (real text, not a scan), so it was re-packed losslessly: "
-        + (L.dup ? L.dup + " embedded object" + (L.dup > 1 ? "s" : "") + " that the file repeated (fonts, images or graphics copied onto every page — " + fmtSize(L.dupBytes) + ") " + (L.dup > 1 ? "were" : "was") + " collapsed to one copy, and " : "")
+        + (L.dup ? L.dup + " embedded object" + (L.dup > 1 ? "s" : "") + " that the file repeated (fonts, images or graphics copied onto every page — " + fmtSize(L.dupBytes) + ") " + (L.dup > 1 ? "were" : "was") + " collapsed to one copy, " : "")
+        + (L.flated ? L.flated + " stream" + (L.flated > 1 ? "s" : "") + " the file had stored uncompressed " + (L.flated > 1 ? "were" : "was") + " compressed (" + fmtSize(L.flatedSaved) + " saved), " : "")
+        + ((L.dup || L.flated) ? "and " : "")
         + "the file was rewritten compactly. Nothing visible changed and the text stays selectable and searchable. Now " + fmtSize(compSize) + " (" + pct + "% smaller)"
         + (underL ? ", under your " + fmtSize(target) + " target." : ". Your " + fmtSize(target) + " target cannot be reached without turning the pages into pictures" + (meta.rasterSize ? ", and even that comes to " + fmtSize(meta.rasterSize) + " at the readable limit" : "") + " — so this is the better file."),
       reduction: pct + "% smaller"
