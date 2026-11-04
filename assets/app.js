@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v33"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v34"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -127,14 +127,25 @@ var FIG_SPAN = 0.02, FIG_TONE_SHIFT = 0.35, FIG_PX_SHIFT = 0.25;
 // (a balance sheet scores 0.05-0.17, prose 0.00-0.02 - even on a blurred
 // photographic scan), or it is clearly above the document's own average.
 var FIG_PAGE_MIN = 0.03;
+var FIG_SCAN_MAX = 200;   // every page is scored up to this many; beyond it a spread of this many
 function isFiguresPage(f){ return f >= FIG_PAGE_MIN || figU(f) >= 0.6; }
 function figU(f){ var base = state.figDoc || 0, span = Math.max(FIG_SPAN, base); return Math.max(-1, Math.min(1, (f - base) / span)); }   // span scales with the document: a scan whose scores are all small still ranks its pages
-// Figures score of a page from its binarised bitmap, cached on the page.
+// Figures score of a page from its binarised bitmap. Scores live in
+// state.figPages (by page number) - pdf.cleanup() drops the page proxies, so
+// a cache on the proxy alone was lost every 50 pages.
+function figScoreOf(pn){ var m = state.figPages; return m && m[pn] != null ? m[pn] : null; }
+function figKnown(page){ return page._hcFig != null || figScoreOf(page.pageNumber) != null; }
+function figOfPage(page){ if(page._hcFig != null) return page._hcFig; var k = figScoreOf(page.pageNumber); return k != null ? k : 0; }
 function pageFigures(page, bits, w, h){
+  var known = figScoreOf(page.pageNumber);
+  if(known != null){ page._hcFig = known; return known; }
   if(page._hcFig != null) return page._hcFig;
   var f = 0; try { f = JB ? JB.figuresScore(bits, w, h) : 0; } catch(e){}
-  page._hcFig = f; return f;
+  page._hcFig = f; if(state.figPages) state.figPages[page.pageNumber] = f; return f;
 }
+// Per-rung size correction (the closed loop learns a different ratio for the
+// 1-bit, tone and crisp-text rungs - they are different encoders).
+function cf(corr, k){ if(!corr) return 1; if(typeof corr === "number") return corr; return corr[k] || 1; }
 function topPx(){ return state.topPx || LONG_MAX; }
 function floorLevel(){ return (READABLE_PX - LONG_MIN) / (topPx() - LONG_MIN); }
 function mulM(m, n){ return [m[0]*n[0]+m[2]*n[1], m[1]*n[0]+m[3]*n[1], m[0]*n[2]+m[2]*n[3], m[1]*n[2]+m[3]*n[3], m[0]*n[4]+m[2]*n[5]+m[4], m[1]*n[4]+m[3]*n[5]+m[5]]; }
@@ -191,20 +202,34 @@ async function documentTopPx(samples){
     if(lp > nat){ nat = lp; info = page._hcNativeInfo; }
   }
   state.nativeLong = nat; state.nativeInfo = info;
-  // document average figures score (sample pages, a cheap 1200 px render)
-  var fsum = 0, fn = 0;
-  for(var k2 = 0; k2 < samples.length; k2++){
-    var pg2 = await state.pdf.getPage(samples[k2]);
-    if(pg2._hcFig == null){
-      var r2 = await renderPage(pg2, Math.min(nat || LONG_MAX, 1800)), n2 = r2.w * r2.h, A3 = analyseLuma(r2.ctx.getImageData(0, 0, r2.w, r2.h).data, n2);   // blurred digits need >= ~1750 px to score
-      var b3 = new Uint8Array(n2); for(var q3 = 0; q3 < n2; q3++) b3[q3] = A3.lum[q3] <= A3.thr ? 1 : 0;
-      if(!A3.isPhoto) pageFigures(pg2, b3, r2.w, r2.h); else pg2._hcFig = 0;
-      r2.canvas.width = 1; r2.canvas.height = 1;
+  // Score EVERY page for tables up front (a spread of FIG_SCAN_MAX pages on a
+  // very long document), once per file: the crisp-text rung prices table
+  // pages and prose pages differently, so the estimate needs the document's
+  // real share of each - 7 spread samples once put a 72-page file 2x over.
+  if(state.figFile !== state.file || !state.figPages){
+    state.figPages = {}; state.figFile = state.file;
+    var n = state.pageCount, scan = n <= FIG_SCAN_MAX ? null : spreadPages(n, FIG_SCAN_MAX), scanN = scan ? scan.length : n;
+    var fsum = 0, fn = 0;
+    for(var k2 = 0; k2 < scanN; k2++){
+      var pn = scan ? scan[k2] : k2 + 1;
+      setProgress(5 + k2 / scanN * 6, "Scanning page " + pn + " of " + n + " for tables and figures...");
+      var pg2 = await state.pdf.getPage(pn);
+      if(!figKnown(pg2)){
+        var r2 = await renderPage(pg2, Math.min(nat || LONG_MAX, 1800)), n2 = r2.w * r2.h, A3 = analyseLuma(r2.ctx.getImageData(0, 0, r2.w, r2.h).data, n2);   // blurred digits need >= ~1750 px to score
+        if(!A3.isPhoto){ var b3 = new Uint8Array(n2); for(var q3 = 0; q3 < n2; q3++) b3[q3] = A3.lum[q3] <= A3.thr ? 1 : 0; pageFigures(pg2, b3, r2.w, r2.h); }
+        else { pg2._hcFig = 0; state.figPages[pn] = 0; }
+        r2.canvas.width = 1; r2.canvas.height = 1;
+      }
+      fsum += figOfPage(pg2); fn++;
+      pg2.cleanup();
+      if(k2 % 50 === 49){ try { await state.pdf.cleanup(); } catch(e){} }
+      if(k2 % 4 === 3) await yieldNow();
     }
-    fsum += pg2._hcFig; fn++;
+    state.figDoc = fn ? fsum / fn : 0;
+    var figN = 0; for(var pk in state.figPages){ if(isFiguresPage(state.figPages[pk])) figN++; }
+    state.figPagesCount = fn ? Math.round(figN * n / fn) : 0;   // extrapolated when only a spread was scanned
+    console.info("HyperCompress: scanned " + fn + " of " + n + " pages for tables - " + figN + " table page(s) found (" + state.figPagesCount + " across the document); scores average " + state.figDoc.toFixed(3));
   }
-  state.figDoc = fn ? fsum / fn : 0;
-  console.info("HyperCompress: figures score of the sample pages averages " + state.figDoc.toFixed(3) + " (pages above it get more quality, prose less)");
   state.topPx = nat ? Math.min(NATIVE_CAP, Math.max(LONG_MAX, nat)) : LONG_MAX;
   console.info("HyperCompress: native page image " + (info ? info.w + "x" + info.h + " (" + info.kind + ") -> " + nat + " px long side" : "not found") + "; top resolution " + state.topPx + " px");
   return state.topPx;
@@ -523,7 +548,7 @@ async function encodePage(page, s){
     // bound of what we will store - symbol coding can only make it smaller).
     if(!bits){ bits = new Uint8Array(n); for(var t = 0; t < n; t++) bits[t] = lum[t] <= thr ? 1 : 0; }
     var genSeg = JB.genericRegionSegment(2, bits, w, h);
-    return { kind: "jbig2", bits: bits, genSeg: genSeg, width: w, height: h, bytes: genSeg.length + 60, thr: thr, ink: ink, longPx: px, glyph: glyph, fig: page._hcFig || 0 };
+    return { kind: "jbig2", bits: bits, genSeg: genSeg, width: w, height: h, bytes: genSeg.length + 60, thr: thr, ink: ink, longPx: px, glyph: glyph, fig: figOfPage(page) };
   }
   // Fallback without the JBIG2 module: pack to 1 bit per pixel, rows padded
   // to a byte; 1 = white, 0 = ink; stored with deflate.
@@ -605,12 +630,12 @@ async function encodeTone(page, t){
   for(var i = 0; i < n; i += 7){ var p = i * 4, mx = Math.max(d[p], d[p + 1], d[p + 2]), mn = Math.min(d[p], d[p + 1], d[p + 2]); cnt++; if(mx - mn > 48 && mx > 60) sat++; }
   var color = sat / cnt > 0.004;
   // figures score of this page (binarise the render once; cached per page)
-  if(page._hcFig == null){
+  if(!figKnown(page)){
     var A2 = analyseLuma(d, n), bb = new Uint8Array(n);
     for(var b2 = 0; b2 < n; b2++) bb[b2] = A2.lum[b2] <= A2.thr ? 1 : 0;
     pageFigures(page, bb, w, h);
   }
-  var tPage = Math.max(0, Math.min(1, t + FIG_TONE_SHIFT * figU(page._hcFig || 0)));
+  var tPage = Math.max(0, Math.min(1, t + FIG_TONE_SHIFT * figU(figOfPage(page))));
   if(!color){
     for(var j = 0, q = 0; j < n; j++, q += 4){ var v = (d[q] * 77 + d[q + 1] * 151 + d[q + 2] * 28) >> 8; d[q] = d[q + 1] = d[q + 2] = v; }
     r.ctx.putImageData(img, 0, 0);
@@ -619,7 +644,7 @@ async function encodeTone(page, t){
   var blob = await new Promise(function(res){ r.canvas.toBlob(function(b){ res(b); }, "image/jpeg", quality); });
   r.canvas.width = 1; r.canvas.height = 1;
   var jp = new Uint8Array(await blob.arrayBuffer());
-  return { kind: "jpeg", data: jp, bytes: jp.length, width: w, height: h, longPx: Math.max(w, h), tone: true, color: color, quality: quality, fig: page._hcFig || 0 };
+  return { kind: "jpeg", data: jp, bytes: jp.length, width: w, height: h, longPx: Math.max(w, h), tone: true, color: color, quality: quality, fig: figOfPage(page) };
 }
 async function estimateTone(t, samples, corr){
   var sum = 0;
@@ -629,7 +654,7 @@ async function estimateTone(t, samples, corr){
     page.cleanup();
   }
   var avg = sum / samples.length;
-  return Math.round((avg * state.pageCount * 1.03 + 1500 + state.pageCount * 40) * (corr || 1) * (state.estScale || 1));
+  return Math.round((avg * state.pageCount * 1.03 + 1500 + state.pageCount * 40) * cf(corr, "tone") * (state.estScale || 1));
 }
 
 // -- MRC rung: crisp text + soft background ---------------------------------
@@ -692,21 +717,48 @@ async function encodeBackground(page, m, textBits, tw, th){
   var jp = new Uint8Array(await blob.arrayBuffer());
   return { data: jp, bytes: jp.length, width: w, height: h, longPx: Math.max(w, h), color: color, quality: quality };
 }
+// The samples for the crisp-text rung: the spread pages split into table and
+// prose pages, plus the document's highest-scoring table pages so a table
+// page is always costed even when none fell in the spread.
+function mrcSamples(samples){
+  var fig = [], prose = [];
+  for(var k = 0; k < samples.length; k++){ var f = figScoreOf(samples[k]); (f != null && isFiguresPage(f) ? fig : prose).push(samples[k]); }
+  var ranked = Object.keys(state.figPages || {}).map(Number).filter(function(p){ return isFiguresPage(state.figPages[p]); }).sort(function(x, y){ return state.figPages[y] - state.figPages[x]; });
+  for(var r = 0; r < ranked.length && fig.length < 3; r++) if(fig.indexOf(ranked[r]) < 0) fig.push(ranked[r]);
+  return { fig: fig, prose: prose };
+}
 async function estimateMrc(m, samples, corr){
-  var sum = 0, sTop = levelToSettings(1);
-  for(var k = 0; k < samples.length; k++){
-    var page = await state.pdf.getPage(samples[k]);
-    var e = await encodePage(page, sTop);
-    if(e.kind === "jbig2" && page._hcFig == null) pageFigures(page, e.bits, e.width, e.height);
-    if(e.kind === "jbig2" && isFiguresPage(page._hcFig || 0)){ e.bits = null; e = await encodeTone(page, m); }
-    sum += e.bytes;
-    if(e.kind === "jbig2" && bgOn(m)){ var bg = await encodeBackground(page, m, e.bits, e.width, e.height); sum += bg.bytes; }
-    page.cleanup();
+  var sTop = levelToSettings(1), n = state.pageCount, S = mrcSamples(samples);
+  var figN = state.figPagesCount != null ? Math.min(n, state.figPagesCount) : Math.round(S.fig.length / Math.max(1, samples.length) * n);
+  var proseN = n - figN, figAvg = 0, proseAvg = 0;
+  if(figN > 0 && S.fig.length){
+    var fs = 0;
+    for(var i = 0; i < S.fig.length; i++){ var pf = await state.pdf.getPage(S.fig[i]); fs += (await encodeTone(pf, m)).bytes; pf.cleanup(); }
+    figAvg = fs / S.fig.length;
   }
-  var avg = sum / samples.length;
-  return Math.round((avg * state.pageCount * 1.03 + 1500 + state.pageCount * 40) * (corr || 1) * (state.estScale || 1));
+  if(S.prose.length){
+    var ps = 0;
+    for(var k = 0; k < S.prose.length; k++){
+      var page = await state.pdf.getPage(S.prose[k]);
+      var e = await encodePage(page, sTop);
+      ps += e.bytes;
+      if(e.kind === "jbig2" && bgOn(m)){ var bg = await encodeBackground(page, m, e.bits, e.width, e.height); ps += bg.bytes; }
+      page.cleanup();
+    }
+    proseAvg = ps / S.prose.length;
+  }
+  if(!S.prose.length) proseAvg = figAvg;      // every sample is a table page: price the rest the same way
+  if(figN > 0 && !S.fig.length) figAvg = proseAvg;
+  return Math.round(((figAvg * figN + proseAvg * proseN) * 1.03 + 1500 + n * 40) * cf(corr, "mrc") * (state.estScale || 1));
 }
 
+// n evenly spread page numbers out of total (all pages when total <= n).
+function spreadPages(total, n){
+  if(n >= total){ var all = []; for(var i = 1; i <= total; i++) all.push(i); return all; }
+  var out = [], seen = {};
+  for(var k = 0; k < n; k++){ var p = 1 + Math.round(k * (total - 1) / (n - 1)); if(!seen[p]){ seen[p] = 1; out.push(p); } }
+  return out;
+}
 // Spread of sample pages used to estimate the whole-document size cheaply.
 function samplePageList(){
   var n = state.pageCount;
@@ -736,14 +788,14 @@ async function estimateTotal(level, samples, corr){
   var avg = sum / samples.length;
   // Image payload dominates; add ~3% PDF structural overhead + a small base.
   // state.estScale: calibration knob for testing the closed loop (default 1).
-  return Math.round((avg * state.pageCount * 1.03 + 1500 + state.pageCount * 40) * (corr || 1) * (state.estScale || 1));
+  return Math.round((avg * state.pageCount * 1.03 + 1500 + state.pageCount * 40) * cf(corr, "bw") * (state.estScale || 1));
 }
 
 // Binary-search the highest (best-quality) level whose estimated size fits the
 // target. If even the most aggressive floor can't reach the target, we still
 // return the floor (the smallest we can make it) rather than giving up.
 async function findLevel(target, corr){
-  corr = corr || 1;
+  corr = corr || { bw: 1, tone: 1, mrc: 1 };
   var samples = samplePageList();
   var aim = target * 0.97; // small margin so the real pass rarely overshoots; the closed loop corrects a miss
 
@@ -754,7 +806,11 @@ async function findLevel(target, corr){
   await documentTopPx(samples);
   var estFloor = await estimateTotal(floorLevel(), samples, corr);
   if(estFloor > target){
-    return { level: floorLevel(), reachable: false, belowReadable: false, floorEstimate: estFloor, estimate: estFloor, textMode: HAS_OCR };
+    // Text (OCR) mode is a last resort for a target even the smallest
+    // readable 1-bit file cannot meet - decided on the RAW estimate only. A
+    // correction learned from an earlier pass must never send a run there.
+    var estRaw = cf(corr, "bw") === 1 ? estFloor : await estimateTotal(floorLevel(), samples, 1);
+    return { level: floorLevel(), reachable: false, belowReadable: false, floorEstimate: estFloor, estimate: estFloor, textMode: HAS_OCR && estRaw > target };
   }
   setProgress(12, "Finding the best quality for your target...");
   var estTop = await estimateTotal(1, samples, corr);
@@ -821,7 +877,7 @@ async function findLevel(target, corr){
 function setProgress(p, label){ return setProgress0(p, passPrefix && label ? passPrefix + label : label); }
 var passPrefix = "";
 async function compressToTarget(target){
-  var corr = 1, result = null, best = null;
+  var corr = { bw: 1, tone: 1, mrc: 1 }, result = null, best = null;
   for(var attempt = 0; attempt < 3; attempt++){
     passPrefix = attempt ? "Pass " + (attempt + 1) + " - using your full size budget. " : "";
     var search = await findLevel(target, corr);
@@ -833,8 +889,9 @@ async function compressToTarget(target){
     var under = actual < target * 0.9 && search.level < 1 - 1e-6;   // more than 10% of the budget unused -> re-run at the level it pays for
     var over = actual > target && search.level > floorLevel() + 1e-6;
     if(!(under || over) || attempt === 2 || !(est > 0)) break;
-    corr *= actual / est;
-    console.info("HyperCompress: pass " + (attempt + 1) + " produced " + actual + " bytes against an estimate of " + est + " - re-running at the level the target pays for (calibration x" + corr.toFixed(2) + ")");
+    var rung = search.tone ? "tone" : (search.mrc ? "mrc" : "bw");
+    corr[rung] *= actual / est;
+    console.info("HyperCompress: pass " + (attempt + 1) + " (" + rung + ") produced " + actual + " bytes against an estimate of " + est + " - re-running at the level the target pays for (" + rung + " calibration x" + corr[rung].toFixed(2) + ")");
   }
   passPrefix = "";
   setProgress(100, "Done!");                   // drop the "Pass N" prefix from the final label
@@ -862,8 +919,8 @@ async function compressPass(target, search){
     try {
       page = await pdf.getPage(i);
       var enc = search.tone ? await encodeTone(page, search.level) : await encodePage(page, s);
-      if(search.mrc && enc.kind === "jbig2" && page._hcFig == null) pageFigures(page, enc.bits, enc.width, enc.height);   // score every page, not only the samples
-      if(search.mrc && enc.kind === "jbig2" && isFiguresPage(page._hcFig || 0)){
+      if(search.mrc && enc.kind === "jbig2" && !figKnown(page)) pageFigures(page, enc.bits, enc.width, enc.height);   // normally known from the up-front scan
+      if(search.mrc && enc.kind === "jbig2" && isFiguresPage(figOfPage(page))){
         // a numbers page: keep the greys - the whole page as grayscale JPEG at native resolution
         enc.bits = null;
         enc = await encodeTone(page, search.level);
@@ -1112,7 +1169,7 @@ function showResult(blob, meta){
   var opts;
   var ni = state.nativeInfo;
   var diag = "Build " + BUILD + " · " + state.pageCount + " pages · scan image " + (ni ? ni.w + "×" + ni.h + " px (" + ni.kind + ")" : "not found") + " · native " + (state.nativeLong || 0) + " px · top " + topPx() + " px"
-    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG" : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "");
+    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG" : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "") + (state.figPagesCount != null ? " · table pages " + state.figPagesCount + "/" + state.pageCount : "");
 
   if(compSize >= origSize){
     // Rasterising this PDF can't beat it even at the most aggressive setting —
@@ -1284,7 +1341,7 @@ function toast(msg, cls){
 }
 
 // Test hook (same convention as the other dashboards' window.__xbrl / __mca).
-window.__hc = { JB: JB, encodePage: encodePage, encodeBackground: encodeBackground, estimateMrc: estimateMrc, encodeTone: encodeTone, estimateTone: estimateTone, toneQuality: toneQuality, nativeLongPx: nativeLongPx, documentTopPx: documentTopPx, floorLevel: floorLevel, topPx: topPx, samplePageList: samplePageList, drawBilevel: drawBilevel, deflateBytes: deflateBytes,
+window.__hc = { JB: JB, findLevel: findLevel, compressToTarget: compressToTarget, encodePage: encodePage, encodeBackground: encodeBackground, estimateMrc: estimateMrc, encodeTone: encodeTone, estimateTone: estimateTone, toneQuality: toneQuality, nativeLongPx: nativeLongPx, documentTopPx: documentTopPx, floorLevel: floorLevel, topPx: topPx, samplePageList: samplePageList, drawBilevel: drawBilevel, deflateBytes: deflateBytes,
   otsuThreshold: otsuThreshold, levelToSettings: levelToSettings, state: state };
 
 if(document.readyState === "loading"){
