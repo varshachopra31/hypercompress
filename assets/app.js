@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v40"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v41"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -1038,8 +1038,64 @@ async function findLevel(target, corr){
 // the budget really pays for. At most two re-runs.
 function setProgress(p, label){ return setProgress0(p, passPrefix && label ? passPrefix + label : label); }
 var passPrefix = "";
+// -- Native PDF: lossless re-pack ---------------------------------------------
+// A document with no page image is a native PDF (real text). Report generators
+// embed the same fonts / logos / graphics on every page as separate objects;
+// collapsing identical streams to one copy and re-saving with object streams
+// is lossless - nothing visible changes, the text stays selectable.
+function fnv(bytes, seed){ var h = seed >>> 0; for(var i = 0; i < bytes.length; i++){ h ^= bytes[i]; h = Math.imul(h, 16777619) >>> 0; } return h; }
+function sameBytes(x, y){ if(x.length !== y.length) return false; for(var i = 0; i < x.length; i++) if(x[i] !== y[i]) return false; return true; }
+async function losslessOptimise(){
+  if(state.losslessFile === state.file && state.lossless !== undefined) return state.lossless;
+  state.losslessFile = state.file; state.lossless = null;
+  try {
+    setProgress(8, "Re-packing the PDF losslessly (removing duplicated fonts and images)...");
+    await yieldNow();
+    var doc = await PDFLib.PDFDocument.load(new Uint8Array(await state.file.arrayBuffer()), { ignoreEncryption: true, updateMetadata: false, throwOnInvalidObject: false });
+    var ctx = doc.context, objs = ctx.enumerateIndirectObjects(), byKey = {}, remap = {}, dupRefs = [], dup = 0, dupBytes = 0, streams = 0;
+    for(var i = 0; i < objs.length; i++){
+      var ref = objs[i][0], obj = objs[i][1];
+      if(!(obj instanceof PDFLib.PDFStream)) continue;
+      var contents = null; try { contents = obj.contents || (obj.getContents && obj.getContents()); } catch(e){ continue; }
+      if(!contents || contents.length < 256) continue;
+      streams++;
+      var key = contents.length + ":" + fnv(contents, 2166136261) + ":" + fnv(contents, 0x9747b28c) + ":" + obj.dict.toString();
+      var prev = byKey[key];
+      if(prev && sameBytes(prev.contents, contents)){ remap[ref.toString()] = prev.ref; dupRefs.push(ref); dup++; dupBytes += contents.length; }
+      else if(!prev) byKey[key] = { ref: ref, contents: contents };
+      if(i % 400 === 399) await yieldNow();
+    }
+    if(dup){
+      var walk = function(v){
+        if(v instanceof PDFLib.PDFRef){ var r = remap[v.toString()]; return r || v; }
+        if(v instanceof PDFLib.PDFStream){ walk(v.dict); return v; }
+        if(v instanceof PDFLib.PDFDict){ var en = v.entries(); for(var k = 0; k < en.length; k++){ var nv = walk(en[k][1]); if(nv !== en[k][1]) v.set(en[k][0], nv); } return v; }
+        if(v instanceof PDFLib.PDFArray){ for(var j = 0; j < v.size(); j++){ var val = v.get(j), nv2 = walk(val); if(nv2 !== val) v.set(j, nv2); } return v; }
+        return v;
+      };
+      for(var w = 0; w < objs.length; w++){ if(!remap[objs[w][0].toString()]) walk(objs[w][1]); if(w % 400 === 399) await yieldNow(); }
+      for(var d = 0; d < dupRefs.length; d++) ctx.delete(dupRefs[d]);
+    }
+    setProgress(10, "Writing the re-packed PDF...");
+    await yieldNow();
+    var out = await doc.save({ useObjectStreams: true, addDefaultPage: false, updateFieldAppearances: false });
+    state.lossless = { bytes: out, dup: dup, dupBytes: dupBytes, streams: streams };
+    console.info("HyperCompress: lossless re-pack " + state.originalSize + " -> " + out.length + " bytes (" + dup + " duplicate stream(s), " + dupBytes + " bytes, removed)");
+  } catch(err){ console.warn("HyperCompress: lossless re-pack failed", err); state.lossless = null; }
+  return state.lossless;
+}
+function losslessResult(target, L, rasterSize){
+  return { blob: new Blob([L.bytes], { type: "application/pdf" }), lossless: L, native: true, rasterSize: rasterSize || 0, level: 1, target: target, reachable: L.bytes.length <= target, belowReadable: false, passes: 1 };
+}
 async function compressToTarget(target){
   var corr = { bw: 1, tone: 1, mrc: 1 }, result = null, best = null;
+  // A native document (no page image): try the lossless re-pack first.
+  await documentTopPx(samplePageList());
+  var native = !(state.nativeLong > 0);
+  if(native){
+    var L0 = await losslessOptimise();
+    if(L0 && L0.bytes.length <= target){ setProgress(100, "Done!"); return losslessResult(target, L0); }
+  }
   for(var attempt = 0; attempt < 3; attempt++){
     passPrefix = attempt ? "Pass " + (attempt + 1) + " - using your full size budget. " : "";
     var search = await findLevel(target, corr);
@@ -1061,7 +1117,12 @@ async function compressToTarget(target){
   }
   passPrefix = "";
   setProgress(100, "Done!");                   // drop the "Pass N" prefix from the final label
-  return best || result;
+  var fin = best || result;
+  if(fin) fin.native = native;
+  // the lossless re-pack is the better file whenever it is the smaller one (text stays text)
+  if(native && state.lossless && fin && state.lossless.bytes.length < fin.blob.size) return losslessResult(target, state.lossless, fin.blob.size);
+  if(native && state.lossless && fin) fin.losslessAlt = state.lossless.bytes.length;   // the text-as-text alternative, for the note
+  return fin;
 }
 
 var toneSawColor = false, allocUp = 0, allocDown = 0, figTonePages = 0, figSkipped = 0, keptPages = 0, keptBytesSum = 0;
@@ -1339,7 +1400,7 @@ function showResult(blob, meta){
   var opts;
   var ni = state.nativeInfo;
   var diag = "Build " + BUILD + " · " + state.pageCount + " pages · scan image " + (ni ? ni.w + "×" + ni.h + " px (" + ni.kind + ")" : "not found") + " · native " + (state.nativeLong || 0) + " px · top " + topPx() + " px"
-    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG q" + (meta.tableQ || 0).toFixed(2) + " @ " + meta.tablePx + " px" + (meta.figSkipped ? " (" + meta.figSkipped + " more as 1-bit)" : "") : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "") + (state.figPagesCount != null ? " · table pages " + state.figPagesCount + "/" + state.pageCount : "") + (photoScan() ? " · sharpened before threshold" : "") + (meta.fragTotal ? " · fine-print pages kept as scanned " + (meta.kept || 0) + "/" + meta.fragTotal : "") + (lowDpiPhotoScan() ? " · low-dpi scan: grayscale rung off" : "");
+    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG q" + (meta.tableQ || 0).toFixed(2) + " @ " + meta.tablePx + " px" + (meta.figSkipped ? " (" + meta.figSkipped + " more as 1-bit)" : "") : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "") + (state.figPagesCount != null ? " · table pages " + state.figPagesCount + "/" + state.pageCount : "") + (photoScan() ? " · sharpened before threshold" : "") + (meta.fragTotal ? " · fine-print pages kept as scanned " + (meta.kept || 0) + "/" + meta.fragTotal : "") + (lowDpiPhotoScan() ? " · low-dpi scan: grayscale rung off" : "") + (meta.native ? " · native PDF (no page image)" : "") + (meta.lossless ? " · lossless re-pack: " + meta.lossless.dup + " duplicate stream(s) of " + meta.lossless.streams + " removed" : "");
 
   if(compSize >= origSize){
     // Rasterising this PDF can't beat it even at the most aggressive setting —
@@ -1370,7 +1431,17 @@ function showResult(blob, meta){
   }
   var softNote = " The resolution was lowered to reach this size, so the text is softer — raise the target a little if you want it crisper.";
 
-  if(compSize <= target && !meta.belowReadable && meta.mrc){
+  if(meta.lossless){
+    var L = meta.lossless, underL = compSize <= target;
+    opts = {
+      title: underL ? "Compressed — losslessly" : "Smallest without turning text into pictures — " + fmtSize(compSize),
+      note: "This PDF is a native document (real text, not a scan), so it was re-packed losslessly: "
+        + (L.dup ? L.dup + " embedded object" + (L.dup > 1 ? "s" : "") + " that the file repeated (fonts, images or graphics copied onto every page — " + fmtSize(L.dupBytes) + ") " + (L.dup > 1 ? "were" : "was") + " collapsed to one copy, and " : "")
+        + "the file was rewritten compactly. Nothing visible changed and the text stays selectable and searchable. Now " + fmtSize(compSize) + " (" + pct + "% smaller)"
+        + (underL ? ", under your " + fmtSize(target) + " target." : ". Your " + fmtSize(target) + " target cannot be reached without turning the pages into pictures" + (meta.rasterSize ? ", and even that comes to " + fmtSize(meta.rasterSize) + " at the readable limit" : "") + " — so this is the better file."),
+      reduction: pct + "% smaller"
+    };
+  } else if(compSize <= target && !meta.belowReadable && meta.mrc){
     var fullM = meta.level >= 1 - 1e-6;
     opts = {
       title: fullM ? "Compressed — full quality" : (auto ? "Compressed — " + auto : "Compressed to your target"),
@@ -1438,7 +1509,8 @@ function showResult(blob, meta){
       : "";
     opts = {
       title: auto ? "Compressed — " + auto + " (readable limit)" : "Smallest readable version — " + fmtSize(compSize),
-      note: why + "This is the smallest this PDF can be with every page still readable: " + fmtSize(compSize) + " (" + pct + "% smaller). Use Preview to check it before downloading." + ocrNote,
+      note: why + "This is the smallest this PDF can be with every page still readable: " + fmtSize(compSize) + " (" + pct + "% smaller). Use Preview to check it before downloading."
+        + (meta.losslessAlt ? " Note this version turns the pages into pictures; a lossless re-pack of this native PDF (text kept as text, selectable) is " + fmtSize(meta.losslessAlt) + " — set that as the target and run again if you would rather have that." : "") + ocrNote,
       reduction: pct + "% smaller",
       ocrTarget: (meta.ocrOffer && HAS_OCR && !auto) ? target : 0
     };
