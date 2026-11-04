@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v39"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v40"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -403,6 +403,24 @@ function runCompression(target, meta){
     var why = (err && (err.message || err.name)) || String(err);
     if(/memory|allocation|array buffer/i.test(why)) why += " — the browser ran out of memory. Close other tabs and try again, or split the PDF into parts.";
     toast("Compression failed: " + why, "err");
+    setProgress(0, "Failed — " + why);
+  });
+}
+
+// Opt-in text recognition, started from the result's button.
+function runTextMode(target){
+  setBusy(true);
+  $("#progressWrap").classList.remove("hidden");
+  $("#resultArea").classList.add("hidden");
+  setProgress(0, "Starting text recognition...");
+  textModeCompress(target, { level: floorLevel() }).then(function(res){
+    setBusy(false);
+    showResult(res.blob, res);
+  }).catch(function(err){
+    setBusy(false);
+    console.error("HyperCompress text mode failed:", err);
+    var why = (err && (err.message || err.name)) || String(err);
+    toast("Text recognition failed: " + why, "err");
     setProgress(0, "Failed — " + why);
   });
 }
@@ -1025,7 +1043,9 @@ async function compressToTarget(target){
   for(var attempt = 0; attempt < 3; attempt++){
     passPrefix = attempt ? "Pass " + (attempt + 1) + " - using your full size budget. " : "";
     var search = await findLevel(target, corr);
-    if(search.textMode){ passPrefix = ""; return textModeCompress(target, search); }
+    // Even the readable floor does not fit: deliver the smallest readable
+    // file now and OFFER text recognition (a button) - never auto-start it.
+    if(search.textMode){ search.textMode = false; search.ocrOffer = true; }
     result = await compressPass(target, search);
     result.passes = attempt + 1;
     var actual = result.blob.size, est = search.estimate || actual;
@@ -1164,6 +1184,7 @@ async function compressPass(target, search){
     blob: new Blob([outBytes], { type: "application/pdf" }),
     reachable: search.reachable,
     belowReadable: search.belowReadable,
+    ocrOffer: !!search.ocrOffer,
     level: search.level,
     target: target,
     settings: s,
@@ -1411,10 +1432,15 @@ function showResult(blob, meta){
     var why = auto
       ? "The " + auto + " preset would have pushed the text past legibility, so we stopped at the readable limit. "
       : "Your " + fmtSize(target) + " target works out to about " + fmtSize(target / Math.max(1, state.pageCount)) + " a page across " + state.pageCount + " pages — below what any compressor can do while the text stays legible. ";
+    var ocrMin = Math.max(1, Math.round(state.pageCount * 20 / 60));
+    var ocrNote = (meta.ocrOffer && HAS_OCR && !auto)
+      ? " Text recognition could get closer to your number: it rebuilds each page from recognised words (every word is verified against the scan - nothing is ever changed - and anything unverified stays as pixels), but it is slow: about " + (ocrMin >= 60 ? (Math.round(ocrMin / 6) / 10) + " hours" : ocrMin + " min") + " for " + state.pageCount + " pages. Press “Try text recognition” below if you want to run it."
+      : "";
     opts = {
       title: auto ? "Compressed — " + auto + " (readable limit)" : "Smallest readable version — " + fmtSize(compSize),
-      note: why + "This is the smallest this PDF can be with every page still readable: " + fmtSize(compSize) + " (" + pct + "% smaller). Use Preview to check it before downloading.",
-      reduction: pct + "% smaller"
+      note: why + "This is the smallest this PDF can be with every page still readable: " + fmtSize(compSize) + " (" + pct + "% smaller). Use Preview to check it before downloading." + ocrNote,
+      reduction: pct + "% smaller",
+      ocrTarget: (meta.ocrOffer && HAS_OCR && !auto) ? target : 0
     };
   }
   opts.diag = diag;
@@ -1434,6 +1460,14 @@ function finishResult(blob, outSize, opts){
   if(!dg){ dg = document.createElement("p"); dg.id = "resultDiag"; dg.style.cssText = "font-size:12px;color:#8a8f98;margin:6px 0 0;text-align:center;word-break:break-word"; note.parentNode.insertBefore(dg, note.nextSibling); }
   dg.textContent = opts.diag || ""; dg.classList.toggle("hidden", !opts.diag);
 
+  // the opt-in text-recognition button (only when the readable floor missed the target)
+  var ob = $("#ocrBtn"); if(ob) ob.remove();
+  if(opts.ocrTarget){
+    ob = document.createElement("button"); ob.id = "ocrBtn"; ob.className = "btn btn-ghost btn-lg"; ob.title = "Slow: recognises the text on every page and rebuilds it as verified words";
+    ob.textContent = "\u{1F50D} Try text recognition (slow)";
+    ob.addEventListener("click", function(){ runTextMode(opts.ocrTarget); });
+    var acts = $("#downloadBtn").parentNode; acts.insertBefore(ob, $("#startOverBtn"));
+  }
   $("#resultOriginal").textContent = fmtSize(origSize);
   $("#resultCompressed").textContent = fmtSize(outSize);
   $("#resultRatio").textContent = fmtRatio(origSize, outSize);
