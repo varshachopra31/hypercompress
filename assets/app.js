@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v37"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v38"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -232,7 +232,10 @@ async function documentTopPx(samples){
     state.figRankIdx = {}; for(var ri = 0; ri < state.figRank.length; ri++) state.figRankIdx[state.figRank[ri]] = ri;
     console.info("HyperCompress: scanned " + fn + " of " + n + " pages for tables - " + figN + " table page(s) found (" + state.figPagesCount + " across the document); scores average " + state.figDoc.toFixed(3));
   }
-  state.topPx = nat ? Math.min(NATIVE_CAP, Math.max(LONG_MAX, nat)) : LONG_MAX;
+  // A photographic scan is rendered up to 2x its native size: the threshold
+  // then follows the soft edges smoothly instead of stair-stepping (a mask
+  // scan is already bitonal - 1x is exact for it).
+  state.topPx = nat ? Math.min(NATIVE_CAP, Math.max(LONG_MAX, (info && info.kind === "image") ? 2 * nat : nat)) : LONG_MAX;
   console.info("HyperCompress: native page image " + (info ? info.w + "x" + info.h + " (" + info.kind + ") -> " + nat + " px long side" : "not found") + "; top resolution " + state.topPx + " px");
   return state.topPx;
 }
@@ -446,6 +449,29 @@ async function renderPage(page, longPx){
   return { canvas: canvas, ctx: ctx, w: canvas.width, h: canvas.height };
 }
 
+// A photographic scan (one JPEG per page) is SOFT: thresholding it directly
+// fills the counters of 6/8/0 and fattens every stroke. An unsharp mask on
+// the luminance before the threshold opens them again (verified on the grain
+// fixture: "81.78" went from filled blobs to clean digits). Only for pages of
+// a photographic scan that are text (not a photo); the threshold is re-derived
+// on the sharpened image. r scales with the render size (1.5 px at native).
+var SHARPEN_AMOUNT = 1.2;
+function photoScan(){ return !!(state.nativeInfo && state.nativeInfo.kind === "image" && state.nativeLong > 0); }
+function lowDpiPhotoScan(){ return photoScan() && state.nativeLong < 2400; }   // below ~200 dpi on A4: grayscale re-encoding reads worse than crisp 1-bit
+function unsharpLuma(lum, w, h, amount, r){
+  var n = w * h, tmp = new Float32Array(n), out = new Uint8Array(n), k = 2 * r + 1, x, y, s, i;
+  for(y = 0; y < h; y++){ var row = y * w; s = 0; for(x = -r; x <= r; x++) s += lum[row + Math.min(w - 1, Math.max(0, x))]; for(x = 0; x < w; x++){ tmp[row + x] = s / k; s += lum[row + Math.min(w - 1, x + r + 1)] - lum[row + Math.max(0, x - r)]; } }
+  for(x = 0; x < w; x++){ s = 0; for(y = -r; y <= r; y++) s += tmp[Math.min(h - 1, Math.max(0, y)) * w + x]; for(y = 0; y < h; y++){ i = y * w + x; var v = lum[i] + amount * (lum[i] - s / k); out[i] = v < 0 ? 0 : (v > 255 ? 255 : (v + 0.5) | 0); s += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x]; } }
+  return out;
+}
+function scanAnalyse(d, n, w, h, px){
+  var A = analyseLuma(d, n);
+  if(!photoScan() || A.isPhoto) return A;
+  var r = Math.max(1, Math.round(px / state.nativeLong * 1.5));
+  var L = unsharpLuma(A.lum, w, h, SHARPEN_AMOUNT, r);
+  for(var i = 0, p = 0; i < n; i++, p += 4){ d[p] = d[p + 1] = d[p + 2] = L[i]; }
+  return analyseLuma(d, n);
+}
 // Encode one page: 1-bit deflate for text, JPEG for photographic pages.
 // Returns { kind, data, bytes, width?, height? }.
 // Luminance analysis shared by the bitmap and text engines: per-page Otsu
@@ -492,7 +518,7 @@ async function encodePage(page, s){
     r = await renderPage(page, px);
     w = r.w; h = r.h; n = w * h;
     img = r.ctx.getImageData(0, 0, w, h); d = img.data;
-    A = analyseLuma(d, n);
+    A = scanAnalyse(d, n, w, h, px);
     if(A.isPhoto || !HAS_DEFLATE || !JB || !s.minGlyph) break;
     bits = new Uint8Array(n);
     for(var t0 = 0; t0 < n; t0++) bits[t0] = A.lum[t0] <= A.thr ? 1 : 0;
@@ -526,7 +552,7 @@ async function encodePage(page, s){
       if(Math.abs(px2 - px) >= 24){
         r.canvas.width = 1; r.canvas.height = 1;
         px = px2; r = await renderPage(page, px); w = r.w; h = r.h; n = w * h;
-        img = r.ctx.getImageData(0, 0, w, h); d = img.data; A = analyseLuma(d, n);
+        img = r.ctx.getImageData(0, 0, w, h); d = img.data; A = scanAnalyse(d, n, w, h, px);
         bits = new Uint8Array(n); for(var t1 = 0; t1 < n; t1++) bits[t1] = A.lum[t1] <= A.thr ? 1 : 0;
       }
     }
@@ -704,7 +730,7 @@ function bgOn(m){ return m >= BG_FROM; }
 function bgM(m){ return Math.max(0, Math.min(1, (m - BG_FROM) / (1 - BG_FROM))); }
 function bgLongPx(m){ var top = Math.min(BG_MAX_CAP, state.nativeLong || BG_MAX_CAP); return Math.round(BG_MIN + bgM(m) * (top - BG_MIN)); }
 function bgQuality(m){ return +(0.45 + bgM(m) * 0.40).toFixed(3); }
-function mrcAvailable(){ return !!(state.nativeLong > 0 && JB); }
+function mrcAvailable(){ return !!(state.nativeLong > 0 && JB && !lowDpiPhotoScan()); }   // a <200 dpi photo scan: grayscale re-encoding reads worse than crisp 1-bit
 async function encodeBackground(page, m, textBits, tw, th){
   var r = await renderPage(page, bgLongPx(m));
   var w = r.w, h = r.h, n = w * h;
@@ -1221,7 +1247,7 @@ function showResult(blob, meta){
   var opts;
   var ni = state.nativeInfo;
   var diag = "Build " + BUILD + " · " + state.pageCount + " pages · scan image " + (ni ? ni.w + "×" + ni.h + " px (" + ni.kind + ")" : "not found") + " · native " + (state.nativeLong || 0) + " px · top " + topPx() + " px"
-    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG q" + (meta.tableQ || 0).toFixed(2) + " @ " + meta.tablePx + " px" + (meta.figSkipped ? " (" + meta.figSkipped + " more as 1-bit)" : "") : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "") + (state.figPagesCount != null ? " · table pages " + state.figPagesCount + "/" + state.pageCount : "");
+    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG q" + (meta.tableQ || 0).toFixed(2) + " @ " + meta.tablePx + " px" + (meta.figSkipped ? " (" + meta.figSkipped + " more as 1-bit)" : "") : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "") + (state.figPagesCount != null ? " · table pages " + state.figPagesCount + "/" + state.pageCount : "") + (photoScan() ? " · sharpened before threshold" : "") + (lowDpiPhotoScan() ? " · low-dpi scan: grayscale rung off" : "");
 
   if(compSize >= origSize){
     // Rasterising this PDF can't beat it even at the most aggressive setting —
@@ -1279,10 +1305,12 @@ function showResult(blob, meta){
     // not read as unused budget: at the top level every page is already at
     // the maximum resolution, and a bigger target cannot buy anything more.
     var slack = "";
-    if(!auto && target && compSize < target * 0.8){
+    if(!auto && target && (compSize < target * 0.8 || meta.level >= 1 - 1e-6)){
       if(meta.level >= 1 - 1e-6){
-        slack = " This is the full-quality version in black & white — every page is stored at the maximum resolution (" + ((meta.settings && meta.settings.longPx) || topPx()) + " px on its long side).";
-        if(meta.toneNeed && meta.toneNeed < origSize) slack += " Keeping the scan’s look (paper tone, stamps, shading under the crisp text) would need a target of about " + fmtSize(meta.toneNeed * 1.08) + " — set that and run again if you prefer it.";
+        slack = " This is the full-quality version in black & white — every page is stored at the maximum resolution (" + ((meta.settings && meta.settings.longPx) || topPx()) + " px on its long side" + (photoScan() ? ", twice the scan’s own " + state.nativeLong + " px, so the outlines are smooth" : "") + ").";
+        if(photoScan()) slack += " Each page was sharpened before it was made black & white, so thin strokes and the counters of 6, 8 and 0 stay open.";
+        if(lowDpiPhotoScan()) slack += " This is roughly a " + (Math.round(state.nativeLong / 11.7 / 10) * 10) + " dpi scan: re-encoding its pages in grayscale reads softer than this crisp version, so the rest of your budget is deliberately left unused — nothing in the file can be made sharper than its source.";
+        else if(meta.toneNeed && meta.toneNeed < origSize) slack += " Keeping the scan’s look (paper tone, stamps, shading under the crisp text) would need a target of about " + fmtSize(meta.toneNeed * 1.08) + " — set that and run again if you prefer it.";
         else slack += " A larger target would not change it.";
       }
       else slack = " The engine ran " + (meta.passes || 1) + " pass" + ((meta.passes || 1) > 1 ? "es" : "") + " to use as much of your target as its size estimate allowed.";
