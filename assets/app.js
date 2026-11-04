@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v29"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v30"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -625,6 +625,74 @@ async function estimateTone(t, samples, corr){
   return Math.round((avg * state.pageCount * 1.03 + 1500 + state.pageCount * 40) * (corr || 1) * (state.estScale || 1));
 }
 
+// -- MRC rung: crisp text + soft background ---------------------------------
+// The page's text stays 1-bit at full resolution; underneath it a LOW-RES
+// JPEG carries what 1-bit loses - paper tone, stamps, shading, signatures.
+// The text is erased from that layer first (using the 1-bit mask), so it
+// does not show as grey shadows under the crisp glyphs. m in [0,1] ->
+// background long side BG_MIN..min(native,1800) px and JPEG quality 0.45..0.85.
+var BG_MIN = 360, BG_MAX_CAP = 1800;
+function bgLongPx(m){ var top = Math.min(BG_MAX_CAP, state.nativeLong || BG_MAX_CAP); return Math.round(BG_MIN + Math.max(0, Math.min(1, m)) * (top - BG_MIN)); }
+function bgQuality(m){ return +(0.45 + Math.max(0, Math.min(1, m)) * 0.40).toFixed(3); }
+function mrcAvailable(){ return !!(state.nativeLong > 0 && JB); }
+async function encodeBackground(page, m, textBits, tw, th){
+  var r = await renderPage(page, bgLongPx(m));
+  var w = r.w, h = r.h, n = w * h;
+  var img = r.ctx.getImageData(0, 0, w, h), d = img.data;
+  var sat = 0, cnt = 0;
+  for(var i = 0; i < n; i += 5){ var p = i * 4, mx = Math.max(d[p], d[p + 1], d[p + 2]), mn = Math.min(d[p], d[p + 1], d[p + 2]); cnt++; if(mx - mn > 48 && mx > 60) sat++; }
+  var color = sat / cnt > 0.004;
+  // 1. which background pixels are under text (any ink in the matching block of the full-res mask, padded by one background pixel)
+  var masked = new Uint8Array(n);
+  if(textBits){
+    var sx = tw / w, sy = th / h, padX = Math.ceil(sx), padY = Math.ceil(sy);
+    for(var y = 0; y < h; y++){
+      var ty0 = Math.max(0, Math.floor(y * sy) - padY), ty1 = Math.min(th, Math.ceil((y + 1) * sy) + padY);
+      for(var x = 0; x < w; x++){
+        var tx0 = Math.max(0, Math.floor(x * sx) - padX), tx1 = Math.min(tw, Math.ceil((x + 1) * sx) + padX), hit = 0;
+        for(var yy = ty0; yy < ty1 && !hit; yy++){ var row = yy * tw; for(var xx = tx0; xx < tx1; xx++){ if(textBits[row + xx]){ hit = 1; break; } } }
+        masked[y * w + x] = hit;
+      }
+    }
+  }
+  // 2. fill the masked pixels with the mean of the unmasked pixels of their block (paper), so the layer holds only what is not text
+  var B = 12, ch = color ? 3 : 1;
+  var lum = null;
+  if(!color){ lum = new Uint8Array(n); for(var j = 0, q = 0; j < n; j++, q += 4) lum[j] = (d[q] * 77 + d[q + 1] * 151 + d[q + 2] * 28) >> 8; }
+  var paper = [235, 235, 235], hist = new Uint32Array(256);
+  for(var k = 0; k < n; k++) if(!masked[k]) hist[color ? d[k * 4 + 1] : lum[k]]++;
+  var acc = 0, tot = n; for(var v = 255; v >= 0; v--){ acc += hist[v]; if(acc > tot * 0.3){ paper = [v, v, v]; break; } }
+  var lastFill = paper.slice();
+  for(var by = 0; by < h; by += B){
+    for(var bx = 0; bx < w; bx += B){
+      var s0 = 0, s1 = 0, s2 = 0, c = 0, y1 = Math.min(h, by + B), x1 = Math.min(w, bx + B);
+      for(var yb = by; yb < y1; yb++) for(var xb = bx; xb < x1; xb++){ var ii = yb * w + xb; if(masked[ii]) continue; if(color){ s0 += d[ii * 4]; s1 += d[ii * 4 + 1]; s2 += d[ii * 4 + 2]; } else s0 += lum[ii]; c++; }
+      var fill = c >= 8 ? (color ? [Math.round(s0 / c), Math.round(s1 / c), Math.round(s2 / c)] : [Math.round(s0 / c), 0, 0]) : lastFill;
+      lastFill = fill;
+      for(var yc = by; yc < y1; yc++) for(var xc = bx; xc < x1; xc++){ var i2 = yc * w + xc; if(masked[i2]){ if(color){ d[i2 * 4] = fill[0]; d[i2 * 4 + 1] = fill[1]; d[i2 * 4 + 2] = fill[2]; } else lum[i2] = fill[0]; } }
+    }
+  }
+  if(!color){ for(var j2 = 0, q2 = 0; j2 < n; j2++, q2 += 4){ d[q2] = d[q2 + 1] = d[q2 + 2] = lum[j2]; } }
+  r.ctx.putImageData(img, 0, 0);
+  var quality = bgQuality(m);
+  var blob = await new Promise(function(res){ r.canvas.toBlob(function(b){ res(b); }, "image/jpeg", quality); });
+  r.canvas.width = 1; r.canvas.height = 1;
+  var jp = new Uint8Array(await blob.arrayBuffer());
+  return { data: jp, bytes: jp.length, width: w, height: h, longPx: Math.max(w, h), color: color, quality: quality };
+}
+async function estimateMrc(m, samples, corr){
+  var sum = 0, sTop = levelToSettings(1);
+  for(var k = 0; k < samples.length; k++){
+    var page = await state.pdf.getPage(samples[k]);
+    var e = await encodePage(page, sTop);
+    sum += e.bytes;
+    if(e.kind === "jbig2"){ var bg = await encodeBackground(page, m, e.bits, e.width, e.height); sum += bg.bytes; }
+    page.cleanup();
+  }
+  var avg = sum / samples.length;
+  return Math.round((avg * state.pageCount * 1.03 + 1500 + state.pageCount * 40) * (corr || 1) * (state.estScale || 1));
+}
+
 // Spread of sample pages used to estimate the whole-document size cheaply.
 function samplePageList(){
   var n = state.pageCount;
@@ -696,8 +764,26 @@ async function findLevel(target, corr){
         }
         return { level: tbest, tone: true, reachable: true, belowReadable: false, estimate: tbestEst };
       }
-      // the tones do not fit: say what they would need, so the user can choose
-      return { level: 1, reachable: true, belowReadable: false, estimate: estTop, toneNeed: estT0 };
+    }
+    // Crisp text + a soft background layer: the rung between 1-bit and
+    // full tone. Fits far more often (a 450 px background is ~10-15 KB).
+    if(mrcAvailable()){
+      setProgress(13, "Checking whether a soft background layer fits your target...");
+      var estM0 = await estimateMrc(0, samples, corr);
+      if(estM0 <= aim){
+        var estM1 = await estimateMrc(1, samples, corr);
+        if(estM1 <= aim) return { level: 1, mrc: true, reachable: true, belowReadable: false, estimate: estM1 };
+        var mlo = 0, mhi = 1, mbest = 0, mbestEst = estM0;
+        for(var mi = 0; mi < 6; mi++){
+          var mmid = (mlo + mhi) / 2;
+          setProgress(14 + mi * 3, "Finding the best background quality for your target...");
+          var estMM = await estimateMrc(mmid, samples, corr);
+          if(estMM <= aim){ mbest = mmid; mbestEst = estMM; mlo = mmid; } else { mhi = mmid; }
+        }
+        return { level: mbest, mrc: true, reachable: true, belowReadable: false, estimate: mbestEst };
+      }
+      // even the softest background does not fit: say what it would need
+      return { level: 1, reachable: true, belowReadable: false, estimate: estTop, toneNeed: estM0 };
     }
     return { level: 1, reachable: true, belowReadable: false, estimate: estTop };
   }
@@ -743,7 +829,7 @@ async function compressToTarget(target){
 
 var toneSawColor = false, allocUp = 0, allocDown = 0;
 async function compressPass(target, search){
-  var s = levelToSettings(search.level);
+  var s = levelToSettings(search.mrc ? 1 : search.level);   // the MRC text layer is always at the top
   toneSawColor = false; allocUp = 0; allocDown = 0;
   var pdf = state.pdf;
   var totalPages = pdf.numPages;
@@ -767,6 +853,7 @@ async function compressPass(target, search){
       var uu = figU(enc.fig || 0); if(uu > 0.05) allocUp++; else if(uu < -0.05) allocDown++;
       var item = { w: origVP.width, h: origVP.height, enc: enc };
       if(enc.kind === "jbig2"){
+        if(search.mrc){ item.bg = await encodeBackground(page, search.level, enc.bits, enc.width, enc.height); if(item.bg.color) toneSawColor = true; }
         item.an = JB.analysePage(enc.bits, enc.width, enc.height, dict);
         enc.bits = null;                                   // the bitmap is no longer needed
       }
@@ -818,6 +905,7 @@ async function compressPass(target, search){
       continue;
     }
     var outPage = outDoc.addPage([it.w, it.h]), e = it.enc;
+    if(it.bg){ var bgImg = await outDoc.embedJpg(it.bg.data); outPage.drawImage(bgImg, { x: 0, y: 0, width: it.w, height: it.h }); }
     if(e.kind === "jbig2"){
       var stream = null;
       var useGlobals = false;
@@ -829,7 +917,7 @@ async function compressPass(target, search){
         stream = new Uint8Array(head.length + e.genSeg.length); stream.set(head, 0); stream.set(e.genSeg, head.length);
         genPages++;
       }
-      drawJbig2(outDoc, outPage, stream, e.width, e.height, it.w, it.h, useGlobals ? globalsRef : null);
+      drawJbig2(outDoc, outPage, stream, e.width, e.height, it.w, it.h, useGlobals ? globalsRef : null, !!it.bg);   // over a background the text is a transparent mask
     } else if(e.kind === "bilevel"){
       drawBilevel(outDoc, outPage, e, it.w, it.h);
     } else {
@@ -853,6 +941,7 @@ async function compressPass(target, search){
     level: search.level,
     target: target,
     settings: s,
+    mrc: !!search.mrc, bgPx: search.mrc ? bgLongPx(search.level) : 0, bgQ: search.mrc ? bgQuality(search.level) : 0,
     allocUp: allocUp, allocDown: allocDown, toneNeed: search.toneNeed || 0, tone: !!search.tone, toneQ: search.tone ? toneQuality(search.level) : 0, toneLongPx: search.tone ? toneLongPx() : 0, toneColor: !!(search.tone && toneSawColor)
   };
 }
@@ -1002,7 +1091,7 @@ function showResult(blob, meta){
   var opts;
   var ni = state.nativeInfo;
   var diag = "Build " + BUILD + " · " + state.pageCount + " pages · scan image " + (ni ? ni.w + "×" + ni.h + " px (" + ni.kind + ")" : "not found") + " · native " + (state.nativeLong || 0) + " px · top " + topPx() + " px"
-    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "");
+    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "");
 
   if(compSize >= origSize){
     // Rasterising this PDF can't beat it even at the most aggressive setting —
@@ -1033,7 +1122,16 @@ function showResult(blob, meta){
   }
   var softNote = " The resolution was lowered to reach this size, so the text is softer — raise the target a little if you want it crisper.";
 
-  if(compSize <= target && !meta.belowReadable && meta.tone){
+  if(compSize <= target && !meta.belowReadable && meta.mrc){
+    var fullM = meta.level >= 1 - 1e-6;
+    opts = {
+      title: fullM ? "Compressed — full quality" : (auto ? "Compressed — " + auto : "Compressed to your target"),
+      note: "Done — now " + fmtSize(compSize) + " (" + pct + "% smaller)" + (auto ? ". " : ", under your " + fmtSize(target) + " target. ")
+        + "The text is stored crisp in black & white at full resolution, and your target left room to keep the scan’s look underneath it: paper tone, stamps, shading and signatures are kept as a soft " + (meta.toneColor ? "colour" : "grayscale") + " background layer (" + meta.bgPx + " px on its long side, quality " + Math.round(meta.bgQ * 100) + "%)."
+        + (fullM ? " That is the sharpest background this rung offers; a much larger target would keep whole pages as photographic JPEG instead." : " A larger target sharpens the background; a smaller one eventually drops it and keeps black & white only."),
+      reduction: pct + "% smaller"
+    };
+  } else if(compSize <= target && !meta.belowReadable && meta.tone){
     var full = meta.level >= 1 - 1e-6, qpct = Math.round(meta.toneQ * 100);
     opts = {
       title: full ? "Compressed — full quality" : (auto ? "Compressed — " + auto : "Compressed to your target"),
@@ -1051,7 +1149,7 @@ function showResult(blob, meta){
     if(!auto && target && compSize < target * 0.8){
       if(meta.level >= 1 - 1e-6){
         slack = " This is the full-quality version in black & white — every page is stored at the maximum resolution (" + ((meta.settings && meta.settings.longPx) || topPx()) + " px on its long side).";
-        if(meta.toneNeed && meta.toneNeed < origSize) slack += " Keeping the scan’s own grey tones instead would need a target of about " + fmtSize(meta.toneNeed * 1.08) + " — set that and run again if you prefer the original look.";
+        if(meta.toneNeed && meta.toneNeed < origSize) slack += " Keeping the scan’s look (paper tone, stamps, shading under the crisp text) would need a target of about " + fmtSize(meta.toneNeed * 1.08) + " — set that and run again if you prefer it.";
         else slack += " A larger target would not change it.";
       }
       else slack = " The engine ran " + (meta.passes || 1) + " pass" + ((meta.passes || 1) > 1 ? "es" : "") + " to use as much of your target as its size estimate allowed.";
@@ -1162,7 +1260,7 @@ function toast(msg, cls){
 }
 
 // Test hook (same convention as the other dashboards' window.__xbrl / __mca).
-window.__hc = { JB: JB, encodePage: encodePage, encodeTone: encodeTone, estimateTone: estimateTone, toneQuality: toneQuality, nativeLongPx: nativeLongPx, documentTopPx: documentTopPx, floorLevel: floorLevel, topPx: topPx, samplePageList: samplePageList, drawBilevel: drawBilevel, deflateBytes: deflateBytes,
+window.__hc = { JB: JB, encodePage: encodePage, encodeBackground: encodeBackground, estimateMrc: estimateMrc, encodeTone: encodeTone, estimateTone: estimateTone, toneQuality: toneQuality, nativeLongPx: nativeLongPx, documentTopPx: documentTopPx, floorLevel: floorLevel, topPx: topPx, samplePageList: samplePageList, drawBilevel: drawBilevel, deflateBytes: deflateBytes,
   otsuThreshold: otsuThreshold, levelToSettings: levelToSettings, state: state };
 
 if(document.readyState === "loading"){
