@@ -308,7 +308,12 @@ function componentBoxes(bits, W, H){
 // long, carry comma/point separators. Returns the fraction of glyphs in such
 // words (prose ~0.00-0.01, a balance sheet ~0.1-0.2). Run upright and
 // rotated, so a sideways table scores too.
-function figuresScoreBoxes(cs){
+// Tolerances carry a PIXEL floor: at 150 dpi a digit is ~12 px tall, so a
+// purely relative 12% band (1.4 px) flips with one pixel of scanner grain on
+// a bounding box - the same table page scored 0.054 or 0.025 depending on
+// the noise. opts.hPx / opts.wPx (default 2) are the floors.
+function figuresScoreBoxes(cs, opts){
+  opts = opts || {}; var hPx = opts.hPx != null ? opts.hPx : 2, wPx = opts.wPx != null ? opts.wPx : 2;
   if(cs.length < 20) return { f: 0, words: 0, numWords: 0 };
   var hs = cs.map(function(c){ return c.h; }).sort(function(u, v){ return u - v; }), mh = hs[hs.length >> 1], hc = hs[Math.floor(hs.length * 0.85)];
   cs.sort(function(u, v){ return (u.y + u.h / 2) - (v.y + v.h / 2); });
@@ -323,8 +328,8 @@ function figuresScoreBoxes(cs){
       var g = word.filter(function(c){ return c.h >= mh * 0.55; }); words++; glyphs += g.length;
       if(g.length >= 3){
         var mw = med(g.map(function(c){ return c.w; })), mhh = med(g.map(function(c){ return c.h; }));
-        var okW = g.filter(function(c){ return Math.abs(c.w - mw) <= 0.3 * mw || c.w < 0.6 * mw; }).length / g.length;
-        var okH = g.filter(function(c){ return Math.abs(c.h - mhh) <= 0.12 * mhh; }).length / g.length;
+        var okW = g.filter(function(c){ return Math.abs(c.w - mw) <= Math.max(wPx, 0.3 * mw) || c.w < 0.6 * mw; }).length / g.length;
+        var okH = g.filter(function(c){ return Math.abs(c.h - mhh) <= Math.max(hPx, 0.12 * mhh); }).length / g.length;
         var seps = word.length - g.length;
         if(okW >= 0.8 && okH >= 0.85 && mhh >= 0.85 * hc && mw < mhh * 0.95 && (g.length <= 12 || seps > 0)){ numWords++; numGlyphs += g.length; }
       }
@@ -334,10 +339,10 @@ function figuresScoreBoxes(cs){
   }
   return { f: glyphs ? numGlyphs / glyphs : 0, words: words, numWords: numWords };
 }
-function figuresScore(bits, W, H){
+function figuresScore(bits, W, H, opts){
   var cs = componentBoxes(bits, W, H);
-  var up = figuresScoreBoxes(cs.map(function(c){ return { x: c.x, y: c.y, w: c.w, h: c.h }; }));
-  var rot = figuresScoreBoxes(cs.map(function(c){ return { x: c.y, y: c.x, w: c.h, h: c.w }; }));
+  var up = figuresScoreBoxes(cs.map(function(c){ return { x: c.x, y: c.y, w: c.w, h: c.h }; }), opts);
+  var rot = figuresScoreBoxes(cs.map(function(c){ return { x: c.y, y: c.x, w: c.h, h: c.w }; }), opts);
   return (rot.numWords > up.numWords * 1.5 && rot.f > up.f) ? rot.f : up.f;
 }
 var NB4 = [[1,0],[-1,0],[0,1],[0,-1]];
