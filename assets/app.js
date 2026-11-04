@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v32"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v33"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -123,6 +123,11 @@ var NATIVE_CAP = 3600;
 // with more figures than average get more quality within the same budget,
 // running prose gets less. u in [-1, 1] = (score - average) / FIG_SPAN.
 var FIG_SPAN = 0.02, FIG_TONE_SHIFT = 0.35, FIG_PX_SHIFT = 0.25;
+// A NUMBERS page: at least FIG_PAGE_MIN of its glyphs sit in digit-like runs
+// (a balance sheet scores 0.05-0.17, prose 0.00-0.02 - even on a blurred
+// photographic scan), or it is clearly above the document's own average.
+var FIG_PAGE_MIN = 0.03;
+function isFiguresPage(f){ return f >= FIG_PAGE_MIN || figU(f) >= 0.6; }
 function figU(f){ var base = state.figDoc || 0, span = Math.max(FIG_SPAN, base); return Math.max(-1, Math.min(1, (f - base) / span)); }   // span scales with the document: a scan whose scores are all small still ranks its pages
 // Figures score of a page from its binarised bitmap, cached on the page.
 function pageFigures(page, bits, w, h){
@@ -191,7 +196,7 @@ async function documentTopPx(samples){
   for(var k2 = 0; k2 < samples.length; k2++){
     var pg2 = await state.pdf.getPage(samples[k2]);
     if(pg2._hcFig == null){
-      var r2 = await renderPage(pg2, 1200), n2 = r2.w * r2.h, A3 = analyseLuma(r2.ctx.getImageData(0, 0, r2.w, r2.h).data, n2);
+      var r2 = await renderPage(pg2, Math.min(nat || LONG_MAX, 1800)), n2 = r2.w * r2.h, A3 = analyseLuma(r2.ctx.getImageData(0, 0, r2.w, r2.h).data, n2);   // blurred digits need >= ~1750 px to score
       var b3 = new Uint8Array(n2); for(var q3 = 0; q3 < n2; q3++) b3[q3] = A3.lum[q3] <= A3.thr ? 1 : 0;
       if(!A3.isPhoto) pageFigures(pg2, b3, r2.w, r2.h); else pg2._hcFig = 0;
       r2.canvas.width = 1; r2.canvas.height = 1;
@@ -634,8 +639,13 @@ async function estimateTone(t, samples, corr){
 // does not show as grey shadows under the crisp glyphs. m in [0,1] ->
 // background long side BG_MIN..min(native,1800) px and JPEG quality 0.45..0.85.
 var BG_MIN = 360, BG_MAX_CAP = 1800;
-function bgLongPx(m){ var top = Math.min(BG_MAX_CAP, state.nativeLong || BG_MAX_CAP); return Math.round(BG_MIN + Math.max(0, Math.min(1, m)) * (top - BG_MIN)); }
-function bgQuality(m){ return +(0.45 + Math.max(0, Math.min(1, m)) * 0.40).toFixed(3); }
+// The rung's first third carries NO background (prose crisp 1-bit, numbers
+// pages grayscale); from m = BG_FROM the background appears and grows.
+var BG_FROM = 0.33;
+function bgOn(m){ return m >= BG_FROM; }
+function bgM(m){ return Math.max(0, Math.min(1, (m - BG_FROM) / (1 - BG_FROM))); }
+function bgLongPx(m){ var top = Math.min(BG_MAX_CAP, state.nativeLong || BG_MAX_CAP); return Math.round(BG_MIN + bgM(m) * (top - BG_MIN)); }
+function bgQuality(m){ return +(0.45 + bgM(m) * 0.40).toFixed(3); }
 function mrcAvailable(){ return !!(state.nativeLong > 0 && JB); }
 async function encodeBackground(page, m, textBits, tw, th){
   var r = await renderPage(page, bgLongPx(m));
@@ -687,8 +697,10 @@ async function estimateMrc(m, samples, corr){
   for(var k = 0; k < samples.length; k++){
     var page = await state.pdf.getPage(samples[k]);
     var e = await encodePage(page, sTop);
+    if(e.kind === "jbig2" && page._hcFig == null) pageFigures(page, e.bits, e.width, e.height);
+    if(e.kind === "jbig2" && isFiguresPage(page._hcFig || 0)){ e.bits = null; e = await encodeTone(page, m); }
     sum += e.bytes;
-    if(e.kind === "jbig2"){ var bg = await encodeBackground(page, m, e.bits, e.width, e.height); sum += bg.bytes; }
+    if(e.kind === "jbig2" && bgOn(m)){ var bg = await encodeBackground(page, m, e.bits, e.width, e.height); sum += bg.bytes; }
     page.cleanup();
   }
   var avg = sum / samples.length;
@@ -829,10 +841,10 @@ async function compressToTarget(target){
   return best || result;
 }
 
-var toneSawColor = false, allocUp = 0, allocDown = 0;
+var toneSawColor = false, allocUp = 0, allocDown = 0, figTonePages = 0;
 async function compressPass(target, search){
   var s = levelToSettings(search.mrc ? 1 : search.level);   // the MRC text layer is always at the top
-  toneSawColor = false; allocUp = 0; allocDown = 0;
+  toneSawColor = false; allocUp = 0; allocDown = 0; figTonePages = 0;
   var pdf = state.pdf;
   var totalPages = pdf.numPages;
   var outDoc = await PDFLib.PDFDocument.create();
@@ -850,12 +862,19 @@ async function compressPass(target, search){
     try {
       page = await pdf.getPage(i);
       var enc = search.tone ? await encodeTone(page, search.level) : await encodePage(page, s);
+      if(search.mrc && enc.kind === "jbig2" && page._hcFig == null) pageFigures(page, enc.bits, enc.width, enc.height);   // score every page, not only the samples
+      if(search.mrc && enc.kind === "jbig2" && isFiguresPage(page._hcFig || 0)){
+        // a numbers page: keep the greys - the whole page as grayscale JPEG at native resolution
+        enc.bits = null;
+        enc = await encodeTone(page, search.level);
+        enc.figTone = true; figTonePages++;
+      }
       var origVP = page.getViewport({ scale: 1 });
       if(enc.color) toneSawColor = true;
       var uu = figU(enc.fig || 0); if(uu > 0.05) allocUp++; else if(uu < -0.05) allocDown++;
       var item = { w: origVP.width, h: origVP.height, enc: enc };
       if(enc.kind === "jbig2"){
-        if(search.mrc){ item.bg = await encodeBackground(page, search.level, enc.bits, enc.width, enc.height); if(item.bg.color) toneSawColor = true; }
+        if(search.mrc && bgOn(search.level)){ item.bg = await encodeBackground(page, search.level, enc.bits, enc.width, enc.height); if(item.bg.color) toneSawColor = true; }
         item.an = JB.analysePage(enc.bits, enc.width, enc.height, dict);
         enc.bits = null;                                   // the bitmap is no longer needed
       }
@@ -943,7 +962,7 @@ async function compressPass(target, search){
     level: search.level,
     target: target,
     settings: s,
-    mrc: !!search.mrc, bgPx: search.mrc ? bgLongPx(search.level) : 0, bgQ: search.mrc ? bgQuality(search.level) : 0,
+    mrc: !!search.mrc, bgOn: !!(search.mrc && bgOn(search.level)), bgPx: search.mrc ? bgLongPx(search.level) : 0, bgQ: search.mrc ? bgQuality(search.level) : 0, figTonePages: figTonePages,
     allocUp: allocUp, allocDown: allocDown, toneNeed: search.toneNeed || 0, tone: !!search.tone, toneQ: search.tone ? toneQuality(search.level) : 0, toneLongPx: search.tone ? toneLongPx() : 0, toneColor: !!(search.tone && toneSawColor)
   };
 }
@@ -1093,7 +1112,7 @@ function showResult(blob, meta){
   var opts;
   var ni = state.nativeInfo;
   var diag = "Build " + BUILD + " · " + state.pageCount + " pages · scan image " + (ni ? ni.w + "×" + ni.h + " px (" + ni.kind + ")" : "not found") + " · native " + (state.nativeLong || 0) + " px · top " + topPx() + " px"
-    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "");
+    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG" : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "");
 
   if(compSize >= origSize){
     // Rasterising this PDF can't beat it even at the most aggressive setting —
@@ -1129,7 +1148,10 @@ function showResult(blob, meta){
     opts = {
       title: fullM ? "Compressed — full quality" : (auto ? "Compressed — " + auto : "Compressed to your target"),
       note: "Done — now " + fmtSize(compSize) + " (" + pct + "% smaller)" + (auto ? ". " : ", under your " + fmtSize(target) + " target. ")
-        + "The text is stored crisp in black & white at full resolution, and your target left room to keep the scan’s look underneath it: paper tone, stamps, shading and signatures are kept as a soft " + (meta.toneColor ? "colour" : "grayscale") + " background layer (" + meta.bgPx + " px on its long side, quality " + Math.round(meta.bgQ * 100) + "%)."
+        + (meta.bgOn
+          ? "The text is stored crisp in black & white at full resolution, and your target left room to keep the scan’s look underneath it: paper tone, stamps, shading and signatures are kept as a soft " + (meta.toneColor ? "colour" : "grayscale") + " background layer (" + meta.bgPx + " px on its long side, quality " + Math.round(meta.bgQ * 100) + "%)."
+          : "Text pages are stored crisp in black & white at full resolution.")
+        + (meta.figTonePages ? " " + meta.figTonePages + " page" + (meta.figTonePages > 1 ? "s" : "") + " of figures " + (meta.figTonePages > 1 ? "were" : "was") + " kept entirely in grayscale at the scan’s full resolution, so the digits keep their shading." : "")
         + (fullM ? " That is the sharpest background this rung offers; a much larger target would keep whole pages as photographic JPEG instead." : " A larger target sharpens the background; a smaller one eventually drops it and keeps black & white only."),
       reduction: pct + "% smaller"
     };
