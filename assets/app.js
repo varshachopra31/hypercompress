@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v35"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v36"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -228,6 +228,8 @@ async function documentTopPx(samples){
     state.figDoc = fn ? fsum / fn : 0;
     var figN = 0; for(var pk in state.figPages){ if(isFiguresPage(state.figPages[pk])) figN++; }
     state.figPagesCount = fn ? Math.round(figN * n / fn) : 0;   // extrapolated when only a spread was scanned
+    state.figRank = Object.keys(state.figPages).map(Number).filter(function(p){ return isFiguresPage(state.figPages[p]); }).sort(function(x, y){ return state.figPages[y] - state.figPages[x]; });
+    state.figRankIdx = {}; for(var ri = 0; ri < state.figRank.length; ri++) state.figRankIdx[state.figRank[ri]] = ri;
     console.info("HyperCompress: scanned " + fn + " of " + n + " pages for tables - " + figN + " table page(s) found (" + state.figPagesCount + " across the document); scores average " + state.figDoc.toFixed(3));
   }
   state.topPx = nat ? Math.min(NATIVE_CAP, Math.max(LONG_MAX, nat)) : LONG_MAX;
@@ -627,7 +629,16 @@ function toneAvailable(){ return !!(state.nativeInfo && state.nativeInfo.kind ==
 var TABLE_PX_LEAN = 0.75;
 function tablePx(m){ var nat = toneLongPx(); return m >= 0 ? nat : Math.max(READABLE_PX, Math.round(nat * (1 + (1 - TABLE_PX_LEAN) * Math.max(-1, m)))); }
 function tableQuality(m){ return toneQuality(Math.max(0, m)); }
-function tableOpts(m){ return { mrc: true, flatten: true, px: tablePx(m), quality: tableQuality(m) }; }
+function tableOpts(m){ return { mrc: true, flatten: true, gray: true, px: tablePx(m), quality: tableQuality(m) }; }
+// Below m = -1 only a FRACTION (m + 2) of the table pages stay grayscale, the
+// densest first (state.figRank, by figures score); the rest are 1-bit.
+function tableFrac(m){ return m >= -1 ? 1 : Math.max(0, m + 2); }
+function tableKept(pn, m){
+  if(m >= -1) return true;
+  var idx = state.figRankIdx ? state.figRankIdx[pn] : null;
+  if(idx == null) return false;                      // not ranked (unscanned on a very long document): 1-bit
+  return idx < Math.ceil(tableFrac(m) * state.figRank.length);
+}
 async function encodeTone(page, t, opts){
   opts = opts || {};
   var r = await renderPage(page, opts.px || toneLongPx());
@@ -636,7 +647,7 @@ async function encodeTone(page, t, opts){
   // colour page? (sampled: a page with a coloured stamp or signature keeps its colour)
   var sat = 0, cnt = 0;
   for(var i = 0; i < n; i += 7){ var p = i * 4, mx = Math.max(d[p], d[p + 1], d[p + 2]), mn = Math.min(d[p], d[p + 1], d[p + 2]); cnt++; if(mx - mn > 48 && mx > 60) sat++; }
-  var color = sat / cnt > 0.004;
+  var color = !opts.gray && sat / cnt > 0.004;   // a table page in the crisp-text rung is always grayscale (its prose siblings are 1-bit)
   // figures score of this page (binarise the render once; cached per page)
   if(!figKnown(page)){
     var A2 = analyseLuma(d, n), bb = new Uint8Array(n);
@@ -747,6 +758,7 @@ function mrcSamples(samples){
 async function estimateMrc(m, samples, corr){
   var sTop = levelToSettings(1), n = state.pageCount, S = mrcSamples(samples);
   var figN = state.figPagesCount != null ? Math.min(n, state.figPagesCount) : Math.round(S.fig.length / Math.max(1, samples.length) * n);
+  figN = Math.round(figN * tableFrac(m));            // below m = -1 only the densest fraction stays grayscale
   var proseN = n - figN, figAvg = 0, proseAvg = 0;
   if(figN > 0 && S.fig.length){
     var fs = 0;
@@ -872,20 +884,22 @@ async function findLevel(target, corr){
       // The rung's floor does not fit. Before giving the tables up to 1-bit,
       // try its LEAN end: table pages at the lowest quality, shrinking towards
       // 75% of native (m in [-1, 0)) - grayscale digits stay readable.
-      setProgress(13, "Trying leaner grayscale for the table pages...");
-      var estL = await estimateMrc(-1, samples, corr);
-      if(estL <= aim){
-        var llo = -1, lhi = 0, lbest = -1, lbestEst = estL;
-        for(var li = 0; li < 6; li++){
-          var lmid = (llo + lhi) / 2;
-          setProgress(14 + li * 3, "Finding the best size for the table pages...");
-          var estLL = await estimateMrc(lmid, samples, corr);
-          if(estLL <= aim){ lbest = lmid; lbestEst = estLL; llo = lmid; } else { lhi = lmid; }
-        }
-        return { level: lbest, mrc: true, lean: true, reachable: true, belowReadable: false, estimate: lbestEst };
+      // The rung's floor does not fit. The rung continues DOWNWARD: m in
+      // [-1,0) shrinks the table pages (lowest quality, long side towards 75%
+      // of native, still grayscale); m in [-2,-1) keeps only the densest
+      // fraction of them in grayscale and stores the rest 1-bit. m = -2 is
+      // pure 1-bit at full resolution, which is known to fit - so the search
+      // always lands somewhere in the rung and the budget is always spent.
+      setProgress(13, "Fitting the table pages into your target...");
+      var llo = -2, lhi = 0, lbest = -2, lbestEst = estTop;
+      for(var li = 0; li < 7; li++){
+        var lmid = (llo + lhi) / 2;
+        setProgress(14 + li * 3, "Finding how much grayscale the table pages can have...");
+        var estLL = await estimateMrc(lmid, samples, corr);
+        if(estLL <= aim){ lbest = lmid; lbestEst = estLL; llo = lmid; } else { lhi = lmid; }
       }
-      // even the leanest grayscale tables do not fit: say what the rung's floor would need
-      return { level: 1, reachable: true, belowReadable: false, estimate: estTop, toneNeed: estM0 };
+      if(lbest <= -2 + 1e-9) return { level: 1, reachable: true, belowReadable: false, estimate: estTop, toneNeed: estM0 };
+      return { level: lbest, mrc: true, lean: true, reachable: true, belowReadable: false, estimate: lbestEst };
     }
     return { level: 1, reachable: true, belowReadable: false, estimate: estTop };
   }
@@ -919,7 +933,7 @@ async function compressToTarget(target){
     var actual = result.blob.size, est = search.estimate || actual;
     if(!best || (actual <= target && (best.blob.size > target || result.level > best.level)) || (best.blob.size > target && actual < best.blob.size)) best = result;
     var under = actual < target * 0.9 && search.level < 1 - 1e-6;   // more than 10% of the budget unused -> re-run at the level it pays for
-    var over = actual > target && search.level > ((search.mrc || search.tone) ? -1 : floorLevel()) + 1e-6;
+    var over = actual > target && search.level > (search.mrc ? -2 : (search.tone ? -1 : floorLevel())) + 1e-6;
     if(!(under || over) || attempt === 2 || !(est > 0)) break;
     var rung = search.tone ? "tone" : (search.mrc ? "mrc" : "bw");
     corr[rung] *= actual / est;
@@ -930,10 +944,10 @@ async function compressToTarget(target){
   return best || result;
 }
 
-var toneSawColor = false, allocUp = 0, allocDown = 0, figTonePages = 0;
+var toneSawColor = false, allocUp = 0, allocDown = 0, figTonePages = 0, figSkipped = 0;
 async function compressPass(target, search){
   var s = levelToSettings(search.mrc ? 1 : search.level);   // the MRC text layer is always at the top
-  toneSawColor = false; allocUp = 0; allocDown = 0; figTonePages = 0;
+  toneSawColor = false; allocUp = 0; allocDown = 0; figTonePages = 0; figSkipped = 0;
   var pdf = state.pdf;
   var totalPages = pdf.numPages;
   var outDoc = await PDFLib.PDFDocument.create();
@@ -952,7 +966,8 @@ async function compressPass(target, search){
       page = await pdf.getPage(i);
       var enc = search.tone ? await encodeTone(page, search.level) : await encodePage(page, s);
       if(search.mrc && enc.kind === "jbig2" && !figKnown(page)) pageFigures(page, enc.bits, enc.width, enc.height);   // normally known from the up-front scan
-      if(search.mrc && enc.kind === "jbig2" && isFiguresPage(figOfPage(page))){
+      if(search.mrc && enc.kind === "jbig2" && isFiguresPage(figOfPage(page)) && !tableKept(page.pageNumber, search.level)) figSkipped++;
+      if(search.mrc && enc.kind === "jbig2" && isFiguresPage(figOfPage(page)) && tableKept(page.pageNumber, search.level)){
         // a numbers page: keep the greys - the whole page as grayscale JPEG at native resolution
         enc.bits = null;
         enc = await encodeTone(page, search.level, tableOpts(search.level));
@@ -1051,7 +1066,7 @@ async function compressPass(target, search){
     level: search.level,
     target: target,
     settings: s,
-    mrc: !!search.mrc, bgOn: !!(search.mrc && bgOn(search.level)), bgPx: search.mrc ? bgLongPx(search.level) : 0, bgQ: search.mrc ? bgQuality(search.level) : 0, figTonePages: figTonePages, tableQ: search.mrc ? tableQuality(search.level) : 0, tablePx: search.mrc ? tablePx(search.level) : 0,
+    mrc: !!search.mrc, bgOn: !!(search.mrc && bgOn(search.level)), bgPx: search.mrc ? bgLongPx(search.level) : 0, bgQ: search.mrc ? bgQuality(search.level) : 0, figTonePages: figTonePages, figSkipped: figSkipped, tableQ: search.mrc ? tableQuality(search.level) : 0, tablePx: search.mrc ? tablePx(search.level) : 0,
     allocUp: allocUp, allocDown: allocDown, toneNeed: search.toneNeed || 0, tone: !!search.tone, toneQ: search.tone ? toneQuality(search.level) : 0, toneLongPx: search.tone ? toneLongPx() : 0, toneColor: !!(search.tone && toneSawColor)
   };
 }
@@ -1201,7 +1216,7 @@ function showResult(blob, meta){
   var opts;
   var ni = state.nativeInfo;
   var diag = "Build " + BUILD + " · " + state.pageCount + " pages · scan image " + (ni ? ni.w + "×" + ni.h + " px (" + ni.kind + ")" : "not found") + " · native " + (state.nativeLong || 0) + " px · top " + topPx() + " px"
-    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG q" + (meta.tableQ || 0).toFixed(2) + " @ " + meta.tablePx + " px" : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "") + (state.figPagesCount != null ? " · table pages " + state.figPagesCount + "/" + state.pageCount : "");
+    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG q" + (meta.tableQ || 0).toFixed(2) + " @ " + meta.tablePx + " px" + (meta.figSkipped ? " (" + meta.figSkipped + " more as 1-bit)" : "") : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "") + (state.figPagesCount != null ? " · table pages " + state.figPagesCount + "/" + state.pageCount : "");
 
   if(compSize >= origSize){
     // Rasterising this PDF can't beat it even at the most aggressive setting —
@@ -1240,7 +1255,7 @@ function showResult(blob, meta){
         + (meta.bgOn
           ? "The text is stored crisp in black & white at full resolution, and your target left room to keep the scan’s look underneath it: paper tone, stamps, shading and signatures are kept as a soft " + (meta.toneColor ? "colour" : "grayscale") + " background layer (" + meta.bgPx + " px on its long side, quality " + Math.round(meta.bgQ * 100) + "%)."
           : "Text pages are stored crisp in black & white at full resolution.")
-        + (meta.figTonePages ? " " + meta.figTonePages + " page" + (meta.figTonePages > 1 ? "s" : "") + " of figures " + (meta.figTonePages > 1 ? "were" : "was") + " kept entirely in grayscale" + (meta.level < 0 ? " at " + meta.tablePx + " px on the long side (reduced from the scan’s " + toneLongPx() + " px to meet the target)" : " at the scan’s full resolution") + ", so the digits keep their shading." : "")
+        + (meta.figTonePages ? " " + meta.figTonePages + " page" + (meta.figTonePages > 1 ? "s" : "") + " of figures " + (meta.figTonePages > 1 ? "were" : "was") + " kept entirely in grayscale" + (meta.level < 0 ? " at " + meta.tablePx + " px on the long side (reduced from the scan’s " + toneLongPx() + " px to meet the target)" : " at the scan’s full resolution") + ", so the digits keep their shading." + (meta.figSkipped ? " The target had no room for all the pages of figures in grayscale, so the " + meta.figSkipped + " least dense " + (meta.figSkipped > 1 ? "were" : "was") + " kept in crisp black & white instead; a larger target takes more of them into grayscale." : "") : "")
         + (fullM ? " That is the sharpest background this rung offers; a much larger target would keep whole pages as photographic JPEG instead." : " A larger target sharpens the background; a smaller one eventually drops it and keeps black & white only."),
       reduction: pct + "% smaller"
     };
