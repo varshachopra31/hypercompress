@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v30"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v31"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -696,7 +696,7 @@ async function estimateMrc(m, samples, corr){
 // Spread of sample pages used to estimate the whole-document size cheaply.
 function samplePageList(){
   var n = state.pageCount;
-  var count = Math.min(n, 5);
+  var count = Math.min(n, 7);
   if(count >= n){
     var all = [];
     for(var i = 1; i <= n; i++) all.push(i);
@@ -731,7 +731,7 @@ async function estimateTotal(level, samples, corr){
 async function findLevel(target, corr){
   corr = corr || 1;
   var samples = samplePageList();
-  var aim = target * 0.95; // margin so the real pass rarely overshoots
+  var aim = target * 0.97; // small margin so the real pass rarely overshoots; the closed loop corrects a miss
 
   // The engine never goes below the READABLE floor: a target that would need
   // smaller pages than that is answered with the smallest readable file and an
@@ -816,7 +816,7 @@ async function compressToTarget(target){
     result.passes = attempt + 1;
     var actual = result.blob.size, est = search.estimate || actual;
     if(!best || (actual <= target && (best.blob.size > target || result.level > best.level)) || (best.blob.size > target && actual < best.blob.size)) best = result;
-    var under = actual < target * 0.8 && search.level < 1 - 1e-6;
+    var under = actual < target * 0.9 && search.level < 1 - 1e-6;   // more than 10% of the budget unused -> re-run at the level it pays for
     var over = actual > target && search.level > floorLevel() + 1e-6;
     if(!(under || over) || attempt === 2 || !(est > 0)) break;
     corr *= actual / est;
