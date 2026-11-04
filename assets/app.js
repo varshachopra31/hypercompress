@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v26"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v27"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -120,43 +120,61 @@ var NATIVE_CAP = 3600;
 function topPx(){ return state.topPx || LONG_MAX; }
 function floorLevel(){ return (READABLE_PX - LONG_MIN) / (topPx() - LONG_MIN); }
 function mulM(m, n){ return [m[0]*n[0]+m[2]*n[1], m[1]*n[0]+m[3]*n[1], m[0]*n[2]+m[2]*n[3], m[1]*n[2]+m[3]*n[3], m[0]*n[4]+m[2]*n[5]+m[4], m[1]*n[4]+m[3]*n[5]+m[5]]; }
+// Resolve a page image object. pdf.js decodes page images asynchronously:
+// a plain get() throws while the decode is pending, so wait for it (bounded).
+function pageObj(page, id){
+  return new Promise(function(res){
+    var done = false;
+    try { page.objs.get(id, function(v){ done = true; res(v); }); }
+    catch(e){ try { var v2 = page.objs.get(id); done = true; res(v2); } catch(e2){ res(null); } }
+    setTimeout(function(){ if(!done) res(null); }, 5000);
+  });
+}
 // Long-side pixel count at which this page's largest page image is drawn 1:1
-// (0 when the page has no sizeable image, e.g. a vector page).
+// (0 when the page has no sizeable image, e.g. a vector page). Also records
+// the image found (page._hcNativeInfo) for the result's diagnostic line.
 async function nativeLongPx(page){
   if(page._hcNative != null) return page._hcNative;
-  var best = 0;
+  var best = 0, info = null;
   try {
     var ops = await page.getOperatorList(), O = pdfjsLib.OPS, vp = page.getViewport({ scale: 1 });
     var ctm = [1, 0, 0, 1, 0, 0], stack = [];
     for(var i = 0; i < ops.fnArray.length; i++){
-      var f = ops.fnArray[i], g = ops.argsArray[i];
+      var f = ops.fnArray[i], g = ops.argsArray[i], cands = [];
       if(f === O.save) stack.push(ctm.slice());
       else if(f === O.restore) ctm = stack.pop() || [1, 0, 0, 1, 0, 0];
       else if(f === O.transform) ctm = mulM(ctm, g);
-      else if(f === O.paintImageMaskXObject || f === O.paintImageXObject || f === O.paintJpegXObject){
-        var w = 0, h = 0;
-        if(f === O.paintImageMaskXObject){ w = g[0].width; h = g[0].height; }
-        else { var ob = null; try { ob = page.objs.get(g[0]); } catch(e){} if(ob){ w = ob.width; h = ob.height; } }
+      else if(f === O.paintImageMaskXObject || f === O.paintInlineImageXObject){ if(g[0]) cands.push({ w: g[0].width, h: g[0].height, kind: f === O.paintImageMaskXObject ? "mask" : "inline image" }); }
+      else if(f === O.paintImageMaskXObjectGroup){ (g[0] || []).forEach(function(m){ if(m) cands.push({ w: m.width, h: m.height, kind: "mask" }); }); }
+      else if(f === O.paintImageXObject || f === O.paintJpegXObject || f === O.paintImageXObjectRepeat || f === O.paintImageMaskXObjectRepeat){
+        var ob = (typeof g[0] === "string") ? await pageObj(page, g[0]) : g[0];
+        if(ob) cands.push({ w: ob.width, h: ob.height, kind: f === O.paintImageMaskXObjectRepeat ? "mask" : "image" });
+      }
+      for(var c = 0; c < cands.length; c++){
+        var w = cands[c].w, h = cands[c].h;
         if(!(w > 0 && h > 0)) continue;
         var wPt = Math.hypot(ctm[0], ctm[1]), hPt = Math.hypot(ctm[2], ctm[3]);   // the unit square under the ctm, in points
         if(!(wPt > 1 && hPt > 1) || wPt * hPt < 0.2 * vp.width * vp.height) continue;   // a logo or seal, not the page image
-        var sc = Math.max(w / wPt, h / hPt);
-        best = Math.max(best, Math.round(Math.max(vp.width, vp.height) * sc));
+        var sc = Math.max(w / wPt, h / hPt), lp = Math.round(Math.max(vp.width, vp.height) * sc);
+        if(lp > best){ best = lp; info = { w: w, h: h, kind: cands[c].kind, longPx: lp }; }
       }
     }
-  } catch(e){}
-  page._hcNative = best;
+  } catch(e){ console.warn("HyperCompress: native-resolution detection failed on a page", e); }
+  page._hcNative = best; page._hcNativeInfo = info;
   return best;
 }
 // The document's top resolution: the largest native size among the sample
 // pages, never below LONG_MAX, never above NATIVE_CAP.
 async function documentTopPx(samples){
-  var nat = 0;
+  var nat = 0, info = null;
   for(var k = 0; k < samples.length; k++){
     var page = await state.pdf.getPage(samples[k]);
-    nat = Math.max(nat, await nativeLongPx(page));
+    var lp = await nativeLongPx(page);
+    if(lp > nat){ nat = lp; info = page._hcNativeInfo; }
   }
+  state.nativeLong = nat; state.nativeInfo = info;
   state.topPx = nat ? Math.min(NATIVE_CAP, Math.max(LONG_MAX, nat)) : LONG_MAX;
+  console.info("HyperCompress: native page image " + (info ? info.w + "x" + info.h + " (" + info.kind + ") -> " + nat + " px long side" : "not found") + "; top resolution " + state.topPx + " px");
   return state.topPx;
 }
 // The floor is really a LETTER size, not a page width: a page of small print
@@ -862,6 +880,9 @@ function showResult(blob, meta){
   var compSize = blob.size;
   var pct = Math.round((1 - compSize / origSize) * 100);
   var opts;
+  var ni = state.nativeInfo;
+  var diag = "Build " + BUILD + " · " + state.pageCount + " pages · scan image " + (ni ? ni.w + "×" + ni.h + " px (" + ni.kind + ")" : "not found") + " · native " + (state.nativeLong || 0) + " px · top " + topPx() + " px"
+    + (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "") + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "");
 
   if(compSize >= origSize){
     // Rasterising this PDF can't beat it even at the most aggressive setting —
@@ -924,6 +945,7 @@ function showResult(blob, meta){
       reduction: pct + "% smaller"
     };
   }
+  opts.diag = diag;
   finishResult(blob, compSize, opts);
 }
 
@@ -936,6 +958,9 @@ function finishResult(blob, outSize, opts){
   var note = $("#resultNote");
   if(opts.note){ note.textContent = opts.note; note.classList.remove("hidden"); }
   else { note.classList.add("hidden"); }
+  var dg = $("#resultDiag");
+  if(!dg){ dg = document.createElement("p"); dg.id = "resultDiag"; dg.style.cssText = "font-size:12px;color:#8a8f98;margin:6px 0 0;text-align:center;word-break:break-word"; note.parentNode.insertBefore(dg, note.nextSibling); }
+  dg.textContent = opts.diag || ""; dg.classList.toggle("hidden", !opts.diag);
 
   $("#resultOriginal").textContent = fmtSize(origSize);
   $("#resultCompressed").textContent = fmtSize(outSize);
