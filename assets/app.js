@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v44"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v45"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -393,6 +393,7 @@ function runCompression(target, meta){
   $("#resultArea").classList.add("hidden");
   setProgress(0, "Starting...");
 
+  state.autoLabel = meta.autoLabel || null;   // null = the user typed a size; forceToTarget may be used to hit it
   compressToTarget(target).then(function(res){
     setBusy(false);
     res.autoLabel = meta.autoLabel;
@@ -1159,6 +1160,9 @@ async function compressToTarget(target){
   for(var attempt = 0; attempt < 3; attempt++){
     passPrefix = attempt ? "Pass " + (attempt + 1) + " - using your full size budget. " : "";
     var search = await findLevel(target, corr);
+    // A TYPED target the readable floor can't meet: hit the size anyway by
+    // rendering below reading resolution (the user asked for this size).
+    if(attempt === 0 && !search.reachable && !state.autoLabel){ return await forceToTarget(target); }
     // Even the readable floor does not fit: deliver the smallest readable
     // file now and OFFER text recognition (a button) - never auto-start it.
     if(search.textMode){ search.textMode = false; search.ocrOffer = true; }
@@ -1495,9 +1499,9 @@ function showResult(blob, meta){
   if(meta.forced){
     var dpi = Math.round(((meta.settings && meta.settings.longPx) || LONG_MIN) / 11.7);
     opts = {
-      title: compSize <= target ? "Fitted to " + fmtSize(target) + " — " + fmtSize(compSize) : "Smallest one-file version — " + fmtSize(compSize),
-      note: (compSize <= target ? "Done — the whole document is one PDF at " + fmtSize(compSize) + " (" + pct + "% smaller), within your " + fmtSize(target) + " target. " : "This is as small as one readable-at-all file gets: " + fmtSize(compSize) + " (" + pct + "% smaller). ")
-        + "To reach this size every page was rendered at about " + dpi + " dpi (" + ((meta.settings && meta.settings.longPx) || LONG_MIN) + " px on the long side), well below normal reading resolution — the layout and headings are clear but the small print is soft, so zoom in to read it. Use Preview to check it is good enough before downloading.",
+      title: compSize <= target ? "Compressed to " + fmtSize(target) + " — " + fmtSize(compSize) : "Smallest one-file version — " + fmtSize(compSize),
+      note: (compSize <= target ? "Done — now " + fmtSize(compSize) + " (" + pct + "% smaller), at your " + fmtSize(target) + " target. " : "This is as small as it goes in one file: " + fmtSize(compSize) + " (" + pct + "% smaller). ")
+        + "To reach this size the pages were rendered at about " + dpi + " dpi (" + ((meta.settings && meta.settings.longPx) || LONG_MIN) + " px on the long side) — below normal reading resolution, so headings are clear but the small print is soft; zoom in to read it. Preview it before downloading.",
       reduction: pct + "% smaller"
     };
   } else if(meta.lossless){
@@ -1585,7 +1589,7 @@ function showResult(blob, meta){
         + (meta.losslessAlt ? " (A lossless re-pack of this native PDF, text kept selectable, is " + fmtSize(meta.losslessAlt) + ".)" : "") + ocrNote,
       reduction: pct + "% smaller",
       ocrTarget: (meta.ocrOffer && HAS_OCR && !auto) ? target : 0,
-      forceTarget: (!auto && target) ? target : 0
+      forceTarget: 0
     };
   }
   opts.diag = diag;
