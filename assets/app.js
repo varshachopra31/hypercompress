@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v42"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v43"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -221,7 +221,7 @@ async function nativeLongPx(page){
 }
 // The document's top resolution: the largest native size among the sample
 // pages, never below LONG_MAX, never above NATIVE_CAP.
-async function documentTopPx(samples){
+async function documentTopPx(samples, opts){
   var nat = 0, info = null;
   for(var k = 0; k < samples.length; k++){
     var page = await state.pdf.getPage(samples[k]);
@@ -233,7 +233,7 @@ async function documentTopPx(samples){
   // very long document), once per file: the crisp-text rung prices table
   // pages and prose pages differently, so the estimate needs the document's
   // real share of each - 7 spread samples once put a 72-page file 2x over.
-  if(state.figFile !== state.file || !state.figPages){
+  if(!(opts && opts.nativeOnly) && (state.figFile !== state.file || !state.figPages)){   // nativeOnly: just the page-image detection (the scan is for the raster ladder)
     state.figPages = {}; state.glyphPages = {}; state.figFile = state.file;
     var n = state.pageCount, scan = n <= FIG_SCAN_MAX ? null : spreadPages(n, FIG_SCAN_MAX), scanN = scan ? scan.length : n;
     var fsum = 0, fn = 0;
@@ -1047,7 +1047,7 @@ function fnv(bytes, seed){ var h = seed >>> 0; for(var i = 0; i < bytes.length; 
 function sameBytes(x, y){ if(x.length !== y.length) return false; for(var i = 0; i < x.length; i++) if(x[i] !== y[i]) return false; return true; }
 async function losslessOptimise(){
   if(state.losslessFile === state.file && state.lossless !== undefined) return state.lossless;
-  state.losslessFile = state.file; state.lossless = null;
+  state.losslessFile = state.file; state.lossless = null; state.losslessErr = null;
   try {
     setProgress(8, "Re-packing the PDF losslessly (removing duplicated fonts and images)...");
     await yieldNow();
@@ -1081,19 +1081,26 @@ async function losslessOptimise(){
     var flated = 0, flatedSaved = 0;
     if(HAS_DEFLATE){
       setProgress(9, "Compressing streams the file left uncompressed...");
-      var FILTER = PDFLib.PDFName.of("Filter");
+      var FILTER = PDFLib.PDFName.of("Filter"), cands = [];
       for(var f2 = 0; f2 < objs.length; f2++){
         var ref2 = objs[f2][0], o2 = objs[f2][1];
         if(remap[ref2.toString()] || !(o2 instanceof PDFLib.PDFStream)) continue;
         if(o2.dict.has(FILTER)) continue;
         var c2 = null; try { c2 = o2.contents || (o2.getContents && o2.getContents()); } catch(e){ continue; }
         if(!c2 || c2.length < 128) continue;
-        var def = await deflateBytes(c2);
-        if(def.length < c2.length * 0.95){
-          var nd = o2.dict.clone(ctx); nd.set(FILTER, PDFLib.PDFName.of("FlateDecode"));
-          ctx.assign(ref2, PDFLib.PDFRawStream.of(nd, def)); flated++; flatedSaved += c2.length - def.length;
+        cands.push({ ref: ref2, obj: o2, contents: c2 });
+      }
+      for(var b0 = 0; b0 < cands.length; b0 += 8){
+        var batch = cands.slice(b0, b0 + 8);
+        var defs = await Promise.all(batch.map(function(c){ return deflateBytes(c.contents); }));
+        for(var bi = 0; bi < batch.length; bi++){
+          var cb = batch[bi], def = defs[bi];
+          if(def.length < cb.contents.length * 0.95){
+            var nd = cb.obj.dict.clone(ctx); nd.set(FILTER, PDFLib.PDFName.of("FlateDecode"));
+            ctx.assign(cb.ref, PDFLib.PDFRawStream.of(nd, def)); flated++; flatedSaved += cb.contents.length - def.length;
+          }
         }
-        if(f2 % 100 === 99) await yieldNow();
+        if(b0 % 80 === 0){ setProgress(9, "Compressing streams the file left uncompressed (" + Math.min(cands.length, b0 + 8) + " of " + cands.length + ")..."); await yieldNow(); }
       }
     }
     setProgress(10, "Writing the re-packed PDF...");
@@ -1101,7 +1108,7 @@ async function losslessOptimise(){
     var out = await doc.save({ useObjectStreams: true, addDefaultPage: false, updateFieldAppearances: false });
     state.lossless = { bytes: out, dup: dup, dupBytes: dupBytes, streams: streams, flated: flated, flatedSaved: flatedSaved };
     console.info("HyperCompress: lossless re-pack " + state.originalSize + " -> " + out.length + " bytes (" + dup + " duplicate stream(s) / " + dupBytes + " bytes removed; " + flated + " uncompressed stream(s) deflated, " + flatedSaved + " bytes saved)");
-  } catch(err){ console.warn("HyperCompress: lossless re-pack failed", err); state.lossless = null; }
+  } catch(err){ console.warn("HyperCompress: lossless re-pack failed", err); state.lossless = null; state.losslessErr = (err && (err.message || err.name)) || String(err); }
   return state.lossless;
 }
 function losslessResult(target, L, rasterSize){
@@ -1110,7 +1117,7 @@ function losslessResult(target, L, rasterSize){
 async function compressToTarget(target){
   var corr = { bw: 1, tone: 1, mrc: 1 }, result = null, best = null;
   // A native document (no page image): try the lossless re-pack first.
-  await documentTopPx(samplePageList());
+  await documentTopPx(samplePageList(), { nativeOnly: true });
   var native = !(state.nativeLong > 0);
   if(native){
     var L0 = await losslessOptimise();
@@ -1420,7 +1427,7 @@ function showResult(blob, meta){
   var opts;
   var ni = state.nativeInfo;
   var diag = "Build " + BUILD + " · " + state.pageCount + " pages · scan image " + (ni ? ni.w + "×" + ni.h + " px (" + ni.kind + ")" : "not found") + " · native " + (state.nativeLong || 0) + " px · top " + topPx() + " px"
-    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG q" + (meta.tableQ || 0).toFixed(2) + " @ " + meta.tablePx + " px" + (meta.figSkipped ? " (" + meta.figSkipped + " more as 1-bit)" : "") : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "") + (state.figPagesCount != null ? " · table pages " + state.figPagesCount + "/" + state.pageCount : "") + (photoScan() ? " · sharpened before threshold" : "") + (meta.fragTotal ? " · fine-print pages kept as scanned " + (meta.kept || 0) + "/" + meta.fragTotal : "") + (lowDpiPhotoScan() ? " · low-dpi scan: grayscale rung off" : "") + (meta.native ? " · native PDF (no page image)" : "") + (meta.lossless ? " · lossless re-pack: " + meta.lossless.dup + " duplicate stream(s) of " + meta.lossless.streams + " removed, " + (meta.lossless.flated || 0) + " uncompressed stream(s) deflated" : "");
+    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG q" + (meta.tableQ || 0).toFixed(2) + " @ " + meta.tablePx + " px" + (meta.figSkipped ? " (" + meta.figSkipped + " more as 1-bit)" : "") : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "") + (state.figPagesCount != null ? " · table pages " + state.figPagesCount + "/" + state.pageCount : "") + (photoScan() ? " · sharpened before threshold" : "") + (meta.fragTotal ? " · fine-print pages kept as scanned " + (meta.kept || 0) + "/" + meta.fragTotal : "") + (lowDpiPhotoScan() ? " · low-dpi scan: grayscale rung off" : "") + (meta.native ? " · native PDF (no page image)" : "") + (meta.lossless ? " · lossless re-pack: " + meta.lossless.dup + " duplicate stream(s) of " + meta.lossless.streams + " removed, " + (meta.lossless.flated || 0) + " uncompressed stream(s) deflated" + (meta.losslessAlt ? " -> " + fmtSize(meta.losslessAlt) : "") : "") + (meta.native && state.losslessErr ? " · lossless re-pack FAILED: " + state.losslessErr : "") + (meta.native && state.lossless && !meta.lossless ? " · lossless re-pack: " + state.lossless.dup + " dup / " + (state.lossless.flated || 0) + " deflated -> " + fmtSize(state.lossless.bytes.length) + " (larger than this)" : "");
 
   if(compSize >= origSize){
     // Rasterising this PDF can't beat it even at the most aggressive setting —
