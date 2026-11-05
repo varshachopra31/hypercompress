@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v45"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v46"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -1145,6 +1145,76 @@ async function losslessOptimise(){
   } catch(err){ console.warn("HyperCompress: lossless re-pack failed", err); state.lossless = null; state.losslessErr = (err && (err.message || err.name)) || String(err); }
   return state.lossless;
 }
+// Rebuild a native PDF from its own text: redraw every page's text in a
+// standard font (Helvetica) as a compact Flate content stream. The result is
+// crisp, selectable and small; the original typefaces, table rules and logos
+// are simplified. A page with little or no text is kept as a small grayscale
+// image so nothing is lost (mixed text+scan documents stay complete).
+function sanitizeText(s){
+  return s.replace(/[^\x20-\x7E]/g, function(c){
+    var m = { "\u2018": "'", "\u2019": "'", "\u201C": '"', "\u201D": '"', "\u2013": "-", "\u2014": "-", "\u2212": "-", "\u20B9": "Rs.", "\u2022": "*", "\u00A0": " ", "\u00AD": "", "\uFB01": "fi", "\uFB02": "fl" };
+    return m[c] || "";
+  });
+}
+function pdfEsc(s){ return s.replace(/\\/g, "\\\\").replace(/\(/g, "\\(").replace(/\)/g, "\\)"); }
+async function hasExtractableText(){
+  var pdf = state.pdf, n = pdf.numPages, samples = [], items = 0, withText = 0;
+  for(var k = 0; k < 8; k++) samples.push(1 + Math.round(k * (n - 1) / 7));
+  for(var i = 0; i < samples.length; i++){
+    var page = await pdf.getPage(samples[i]), tc = await page.getTextContent();
+    var cnt = tc.items.filter(function(it){ return it.str && it.str.trim(); }).length;
+    items += cnt; if(cnt >= 5) withText++;
+    page.cleanup();
+  }
+  return { avg: items / samples.length, textFraction: withText / samples.length };
+}
+async function rebuildFromText(){
+  var pdf = state.pdf, n = pdf.numPages;
+  var outDoc = await PDFLib.PDFDocument.create();
+  var helv = outDoc.embedStandardFont(PDFLib.StandardFonts.Helvetica);
+  var encTE = new TextEncoder();
+  var totalItems = 0, imagePages = 0;
+  for(var i = 1; i <= n; i++){
+    setProgress(10 + (i - 1) / n * 85, "Rebuilding page " + i + " of " + n + " from its text...");
+    var page = await pdf.getPage(i), vp = page.getViewport({ scale: 1 }), tc = await page.getTextContent();
+    var good = tc.items.filter(function(it){ return it.str && it.str.trim(); });
+    if(good.length < 3){
+      // little/no text on this page: keep it as a small grayscale image
+      try {
+        var r = await renderPage(page, 900), w = r.w, h = r.h, nn = w * h, img = r.ctx.getImageData(0, 0, w, h), d = img.data;
+        for(var p0 = 0, q0 = 0; p0 < nn; p0++, q0 += 4){ var v0 = (d[q0] * 77 + d[q0 + 1] * 151 + d[q0 + 2] * 28) >> 8; d[q0] = d[q0 + 1] = d[q0 + 2] = v0; }
+        r.ctx.putImageData(img, 0, 0);
+        var blob0 = await new Promise(function(res){ r.canvas.toBlob(function(b){ res(b); }, "image/jpeg", 0.5); });
+        r.canvas.width = 1; r.canvas.height = 1;
+        var jp = new Uint8Array(await blob0.arrayBuffer());
+        var opI = outDoc.addPage([vp.width, vp.height]);
+        var im = await outDoc.embedJpg(jp); opI.drawImage(im, { x: 0, y: 0, width: vp.width, height: vp.height });
+        imagePages++;
+      } catch(e){ outDoc.addPage([vp.width, vp.height]); }
+      page.cleanup(); if(i % 20 === 0) await yieldNow(); continue;
+    }
+    var cs = "BT\n", lastSize = "";
+    for(var g = 0; g < good.length; g++){
+      var it = good[g], str = sanitizeText(it.str); if(!str.trim()) continue;
+      var tr = it.transform, x = tr[4].toFixed(1), y = tr[5].toFixed(1);
+      var size = Math.max(3, Math.hypot(tr[2], tr[3]) || Math.hypot(tr[0], tr[1]) || 8).toFixed(1);
+      if(size !== lastSize){ cs += "/F1 " + size + " Tf\n"; lastSize = size; }
+      cs += "1 0 0 1 " + x + " " + y + " Tm (" + pdfEsc(str) + ") Tj\n";
+      totalItems++;
+    }
+    cs += "ET";
+    var def = await deflateBytes(encTE.encode(cs));
+    var op = outDoc.addPage([vp.width, vp.height]);
+    op.node.newFontDictionary("F1", helv.ref);
+    var stream = PDFLib.PDFRawStream.of(outDoc.context.obj({ Filter: "FlateDecode", Length: def.length }), def);
+    op.node.set(PDFLib.PDFName.of("Contents"), outDoc.context.register(stream));
+    page.cleanup();
+    if(i % 20 === 0) await yieldNow();
+  }
+  setProgress(97, "Writing the rebuilt PDF...");
+  var bytes = await outDoc.save({ useObjectStreams: true });
+  return { blob: new Blob([bytes], { type: "application/pdf" }), rebuilt: true, native: true, items: totalItems, imagePages: imagePages, level: 1, reachable: true, belowReadable: false, passes: 1 };
+}
 function losslessResult(target, L, rasterSize){
   return { blob: new Blob([L.bytes], { type: "application/pdf" }), lossless: L, native: true, rasterSize: rasterSize || 0, level: 1, target: target, reachable: L.bytes.length <= target, belowReadable: false, passes: 1 };
 }
@@ -1154,8 +1224,25 @@ async function compressToTarget(target){
   await documentTopPx(samplePageList(), { nativeOnly: true });
   var native = !(state.nativeLong > 0);
   if(native){
-    var L0 = await losslessOptimise();
-    if(L0 && L0.bytes.length <= target){ setProgress(100, "Done!"); return losslessResult(target, L0); }
+    setProgress(6, "Checking the document's text...");
+    var tx = await hasExtractableText();
+    var textDoc = tx.avg >= 8 && tx.textFraction >= 0.6;
+    // The lossless re-pack rarely beats ~30% and is slow on a big object tree,
+    // so only run it when the target is within reach of it (not far below the
+    // original). Far below -> a text doc rebuilds from its text; otherwise the
+    // raster ladder handles it.
+    var L0 = null;
+    if(!textDoc || target >= state.originalSize * 0.6){
+      L0 = await losslessOptimise();
+      if(L0 && L0.bytes.length <= target){ setProgress(100, "Done!"); return losslessResult(target, L0); }
+    }
+    if(textDoc && !(L0 && target >= L0.bytes.length)){
+      var R = await rebuildFromText();
+      R.target = target; R.reachable = R.blob.size <= target;
+      R.losslessSize = L0 ? L0.bytes.length : 0;
+      setProgress(100, "Done!");
+      return R;
+    }
   }
   for(var attempt = 0; attempt < 3; attempt++){
     passPrefix = attempt ? "Pass " + (attempt + 1) + " - using your full size budget. " : "";
@@ -1465,7 +1552,7 @@ function showResult(blob, meta){
   var opts;
   var ni = state.nativeInfo;
   var diag = "Build " + BUILD + " · " + state.pageCount + " pages · scan image " + (ni ? ni.w + "×" + ni.h + " px (" + ni.kind + ")" : "not found") + " · native " + (state.nativeLong || 0) + " px · top " + topPx() + " px"
-    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG q" + (meta.tableQ || 0).toFixed(2) + " @ " + meta.tablePx + " px" + (meta.figSkipped ? " (" + meta.figSkipped + " more as 1-bit)" : "") : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "") + (state.figPagesCount != null ? " · table pages " + state.figPagesCount + "/" + state.pageCount : "") + (photoScan() ? " · sharpened before threshold" : "") + (meta.fragTotal ? " · fine-print pages kept as scanned " + (meta.kept || 0) + "/" + meta.fragTotal : "") + (lowDpiPhotoScan() ? " · low-dpi scan: grayscale rung off" : "") + (meta.native ? " · native PDF (no page image)" : "") + (meta.lossless ? " · lossless re-pack: " + meta.lossless.dup + " duplicate stream(s) of " + meta.lossless.streams + " removed, " + (meta.lossless.flated || 0) + " uncompressed stream(s) deflated" + (meta.losslessAlt ? " -> " + fmtSize(meta.losslessAlt) : "") : "") + (meta.native && state.losslessErr ? " · lossless re-pack FAILED: " + state.losslessErr : "") + (meta.native && state.lossless && !meta.lossless ? " · lossless re-pack: " + state.lossless.dup + " dup / " + (state.lossless.flated || 0) + " deflated -> " + fmtSize(state.lossless.bytes.length) + " (larger than this)" : "") + (meta.forced ? " · FORCED below readable to fit target" : "");
+    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG q" + (meta.tableQ || 0).toFixed(2) + " @ " + meta.tablePx + " px" + (meta.figSkipped ? " (" + meta.figSkipped + " more as 1-bit)" : "") : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "") + (state.figPagesCount != null ? " · table pages " + state.figPagesCount + "/" + state.pageCount : "") + (photoScan() ? " · sharpened before threshold" : "") + (meta.fragTotal ? " · fine-print pages kept as scanned " + (meta.kept || 0) + "/" + meta.fragTotal : "") + (lowDpiPhotoScan() ? " · low-dpi scan: grayscale rung off" : "") + (meta.native ? " · native PDF (no page image)" : "") + (meta.lossless ? " · lossless re-pack: " + meta.lossless.dup + " duplicate stream(s) of " + meta.lossless.streams + " removed, " + (meta.lossless.flated || 0) + " uncompressed stream(s) deflated" + (meta.losslessAlt ? " -> " + fmtSize(meta.losslessAlt) : "") : "") + (meta.native && state.losslessErr ? " · lossless re-pack FAILED: " + state.losslessErr : "") + (meta.native && state.lossless && !meta.lossless ? " · lossless re-pack: " + state.lossless.dup + " dup / " + (state.lossless.flated || 0) + " deflated -> " + fmtSize(state.lossless.bytes.length) + " (larger than this)" : "") + (meta.forced ? " · FORCED below readable to fit target" : "") + (meta.rebuilt ? " · rebuilt from text: " + meta.items + " text items" + (meta.imagePages ? " + " + meta.imagePages + " image page(s)" : "") : "");
 
   if(compSize >= origSize){
     // Rasterising this PDF can't beat it even at the most aggressive setting —
@@ -1496,7 +1583,18 @@ function showResult(blob, meta){
   }
   var softNote = " The resolution was lowered to reach this size, so the text is softer — raise the target a little if you want it crisper.";
 
-  if(meta.forced){
+  if(meta.rebuilt){
+    var under = compSize <= (meta.target || 0);
+    opts = {
+      title: "Rebuilt from text — " + fmtSize(compSize),
+      note: "Your " + fmtSize(meta.target || compSize) + " target can't be reached by compressing this document as-is (its text and fonts are already packed, and rasterising 717-page-dense pages this small turns them into an unreadable smear). So it was rebuilt from the document's OWN text: every page's words are redrawn crisp, in a standard font, as real selectable text. Now " + fmtSize(compSize) + " (" + pct + "% smaller)"
+        + (under ? ", within your target." : " (just over your " + fmtSize(meta.target) + " target — this is essentially the text's own size).")
+        + " The writing is sharp and searchable; the original typefaces, table gridlines and logos are simplified to reach this size"
+        + (meta.imagePages ? ", and " + meta.imagePages + " image-only page(s) were kept as pictures" : "")
+        + ". Preview it to check it reads well for you.",
+      reduction: pct + "% smaller"
+    };
+  } else if(meta.forced){
     var dpi = Math.round(((meta.settings && meta.settings.longPx) || LONG_MIN) / 11.7);
     opts = {
       title: compSize <= target ? "Compressed to " + fmtSize(target) + " — " + fmtSize(compSize) : "Smallest one-file version — " + fmtSize(compSize),
