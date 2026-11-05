@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v43"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v44"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -408,6 +408,39 @@ function runCompression(target, meta){
 }
 
 // Opt-in text recognition, started from the result's button.
+// Fit to the target even below the readable floor: binary-search the 1-bit
+// resolution (level 0 = 450 px up to the readable floor) for the largest that
+// fits, render there, and deliver it with an honest "small & soft" note.
+async function forceToTarget(target){
+  var samples = samplePageList(), corr = 1, floor = floorLevel();
+  setProgress(6, "Finding the resolution that fits your size...");
+  for(var attempt = 0; attempt < 2; attempt++){
+    var lo = 0, hi = floor, best = 0, bestEst = await estimateTotal(0, samples, corr);
+    if(bestEst <= target){
+      for(var it = 0; it < 6; it++){ var mid = (lo + hi) / 2; var est = await estimateTotal(mid, samples, corr); if(est <= target){ best = mid; bestEst = est; lo = mid; } else hi = mid; }
+    }
+    var res = await compressPass(target, { level: best, force: true });
+    res.forced = true; res.passes = attempt + 1;
+    var actual = res.blob.size;
+    if(actual <= target || attempt === 1 || best <= 1e-6 || !(bestEst > 0)){ res.belowReadable = false; return res; }
+    corr *= actual / bestEst;   // overshot: recalibrate and try once more
+  }
+}
+function runForceToTarget(target){
+  setBusy(true);
+  $("#progressWrap").classList.remove("hidden");
+  $("#resultArea").classList.add("hidden");
+  setProgress(0, "Making it fit your size...");
+  forceToTarget(target).then(function(res){
+    setBusy(false);
+    showResult(res.blob, res);
+  }).catch(function(err){
+    setBusy(false);
+    console.error("HyperCompress force-to-target failed:", err);
+    toast("Could not fit the target: " + ((err && (err.message || err.name)) || String(err)), "err");
+    setProgress(0, "Failed");
+  });
+}
 function runTextMode(target){
   setBusy(true);
   $("#progressWrap").classList.remove("hidden");
@@ -1155,6 +1188,7 @@ async function compressToTarget(target){
 var toneSawColor = false, allocUp = 0, allocDown = 0, figTonePages = 0, figSkipped = 0, keptPages = 0, keptBytesSum = 0;
 async function compressPass(target, search){
   var s = levelToSettings(search.mrc ? 1 : search.level);   // the MRC text layer is always at the top
+  if(search.force){ s.minGlyph = 0; }   // below the readable floor: keep the exact low resolution, no glyph-size bump
   toneSawColor = false; allocUp = 0; allocDown = 0; figTonePages = 0; figSkipped = 0; keptPages = 0; keptBytesSum = 0;
   var pdf = state.pdf;
   var totalPages = pdf.numPages;
@@ -1427,7 +1461,7 @@ function showResult(blob, meta){
   var opts;
   var ni = state.nativeInfo;
   var diag = "Build " + BUILD + " · " + state.pageCount + " pages · scan image " + (ni ? ni.w + "×" + ni.h + " px (" + ni.kind + ")" : "not found") + " · native " + (state.nativeLong || 0) + " px · top " + topPx() + " px"
-    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG q" + (meta.tableQ || 0).toFixed(2) + " @ " + meta.tablePx + " px" + (meta.figSkipped ? " (" + meta.figSkipped + " more as 1-bit)" : "") : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "") + (state.figPagesCount != null ? " · table pages " + state.figPagesCount + "/" + state.pageCount : "") + (photoScan() ? " · sharpened before threshold" : "") + (meta.fragTotal ? " · fine-print pages kept as scanned " + (meta.kept || 0) + "/" + meta.fragTotal : "") + (lowDpiPhotoScan() ? " · low-dpi scan: grayscale rung off" : "") + (meta.native ? " · native PDF (no page image)" : "") + (meta.lossless ? " · lossless re-pack: " + meta.lossless.dup + " duplicate stream(s) of " + meta.lossless.streams + " removed, " + (meta.lossless.flated || 0) + " uncompressed stream(s) deflated" + (meta.losslessAlt ? " -> " + fmtSize(meta.losslessAlt) : "") : "") + (meta.native && state.losslessErr ? " · lossless re-pack FAILED: " + state.losslessErr : "") + (meta.native && state.lossless && !meta.lossless ? " · lossless re-pack: " + state.lossless.dup + " dup / " + (state.lossless.flated || 0) + " deflated -> " + fmtSize(state.lossless.bytes.length) + " (larger than this)" : "");
+    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG q" + (meta.tableQ || 0).toFixed(2) + " @ " + meta.tablePx + " px" + (meta.figSkipped ? " (" + meta.figSkipped + " more as 1-bit)" : "") : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "") + (state.figPagesCount != null ? " · table pages " + state.figPagesCount + "/" + state.pageCount : "") + (photoScan() ? " · sharpened before threshold" : "") + (meta.fragTotal ? " · fine-print pages kept as scanned " + (meta.kept || 0) + "/" + meta.fragTotal : "") + (lowDpiPhotoScan() ? " · low-dpi scan: grayscale rung off" : "") + (meta.native ? " · native PDF (no page image)" : "") + (meta.lossless ? " · lossless re-pack: " + meta.lossless.dup + " duplicate stream(s) of " + meta.lossless.streams + " removed, " + (meta.lossless.flated || 0) + " uncompressed stream(s) deflated" + (meta.losslessAlt ? " -> " + fmtSize(meta.losslessAlt) : "") : "") + (meta.native && state.losslessErr ? " · lossless re-pack FAILED: " + state.losslessErr : "") + (meta.native && state.lossless && !meta.lossless ? " · lossless re-pack: " + state.lossless.dup + " dup / " + (state.lossless.flated || 0) + " deflated -> " + fmtSize(state.lossless.bytes.length) + " (larger than this)" : "") + (meta.forced ? " · FORCED below readable to fit target" : "");
 
   if(compSize >= origSize){
     // Rasterising this PDF can't beat it even at the most aggressive setting —
@@ -1458,7 +1492,15 @@ function showResult(blob, meta){
   }
   var softNote = " The resolution was lowered to reach this size, so the text is softer — raise the target a little if you want it crisper.";
 
-  if(meta.lossless){
+  if(meta.forced){
+    var dpi = Math.round(((meta.settings && meta.settings.longPx) || LONG_MIN) / 11.7);
+    opts = {
+      title: compSize <= target ? "Fitted to " + fmtSize(target) + " — " + fmtSize(compSize) : "Smallest one-file version — " + fmtSize(compSize),
+      note: (compSize <= target ? "Done — the whole document is one PDF at " + fmtSize(compSize) + " (" + pct + "% smaller), within your " + fmtSize(target) + " target. " : "This is as small as one readable-at-all file gets: " + fmtSize(compSize) + " (" + pct + "% smaller). ")
+        + "To reach this size every page was rendered at about " + dpi + " dpi (" + ((meta.settings && meta.settings.longPx) || LONG_MIN) + " px on the long side), well below normal reading resolution — the layout and headings are clear but the small print is soft, so zoom in to read it. Use Preview to check it is good enough before downloading.",
+      reduction: pct + "% smaller"
+    };
+  } else if(meta.lossless){
     var L = meta.lossless, underL = compSize <= target;
     opts = {
       title: underL ? "Compressed — losslessly" : "Smallest without turning text into pictures — " + fmtSize(compSize),
@@ -1538,10 +1580,12 @@ function showResult(blob, meta){
       : "";
     opts = {
       title: auto ? "Compressed — " + auto + " (readable limit)" : "Smallest readable version — " + fmtSize(compSize),
-      note: why + "This is the smallest this PDF can be with every page still readable: " + fmtSize(compSize) + " (" + pct + "% smaller). Use Preview to check it before downloading."
-        + (meta.losslessAlt ? " Note this version turns the pages into pictures; a lossless re-pack of this native PDF (text kept as text, selectable) is " + fmtSize(meta.losslessAlt) + " — set that as the target and run again if you would rather have that." : "") + ocrNote,
+      note: why + "This is the smallest this PDF can be with every page still readable: " + fmtSize(compSize) + " (" + pct + "% smaller)."
+        + " If you need it in ONE file at your " + fmtSize(target) + " target, press “Fit to " + fmtSize(target) + " anyway” below — it renders the pages smaller and softer to hit the size."
+        + (meta.losslessAlt ? " (A lossless re-pack of this native PDF, text kept selectable, is " + fmtSize(meta.losslessAlt) + ".)" : "") + ocrNote,
       reduction: pct + "% smaller",
-      ocrTarget: (meta.ocrOffer && HAS_OCR && !auto) ? target : 0
+      ocrTarget: (meta.ocrOffer && HAS_OCR && !auto) ? target : 0,
+      forceTarget: (!auto && target) ? target : 0
     };
   }
   opts.diag = diag;
@@ -1562,6 +1606,13 @@ function finishResult(blob, outSize, opts){
   dg.textContent = opts.diag || ""; dg.classList.toggle("hidden", !opts.diag);
 
   // the opt-in text-recognition button (only when the readable floor missed the target)
+  var fb = $("#forceBtn"); if(fb) fb.remove();
+  if(opts.forceTarget){
+    fb = document.createElement("button"); fb.id = "forceBtn"; fb.className = "btn btn-ghost btn-lg"; fb.title = "Rasterises the pages smaller to hit your size - text becomes soft; zoom in to read";
+    fb.textContent = "📐 Fit to " + fmtSize(opts.forceTarget) + " anyway";
+    fb.addEventListener("click", function(){ runForceToTarget(opts.forceTarget); });
+    $("#downloadBtn").parentNode.insertBefore(fb, $("#startOverBtn"));
+  }
   var ob = $("#ocrBtn"); if(ob) ob.remove();
   if(opts.ocrTarget){
     ob = document.createElement("button"); ob.id = "ocrBtn"; ob.className = "btn btn-ghost btn-lg"; ob.title = "Slow: recognises the text on every page and rebuilds it as verified words";
