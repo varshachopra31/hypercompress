@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v47"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v49"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -412,18 +412,27 @@ function runCompression(target, meta){
 // Fit to the target even below the readable floor: binary-search the 1-bit
 // resolution (level 0 = 450 px up to the readable floor) for the largest that
 // fits, render there, and deliver it with an honest "small & soft" note.
+async function estimateForced(level, samples, corr){
+  var s = levelToSettings(level); s.minGlyph = 0;   // same as the forced render - no readable-glyph bump
+  var sum = 0;
+  for(var k = 0; k < samples.length; k++){ var pg = await state.pdf.getPage(samples[k]); sum += (await encodePage(pg, s)).bytes; pg.cleanup(); }
+  var avg = sum / samples.length;
+  return Math.round((avg * state.pageCount * 1.03 + 1500 + state.pageCount * 40) * (corr || 1) * (state.estScale || 1));
+}
 async function forceToTarget(target){
-  var samples = samplePageList(), corr = 1, floor = floorLevel();
+  var samples = samplePageList(), corr = 1;
   setProgress(6, "Finding the resolution that fits your size...");
   for(var attempt = 0; attempt < 2; attempt++){
-    var lo = 0, hi = floor, best = 0, bestEst = await estimateTotal(0, samples, corr);
+    // Highest resolution (level 0 = 450px .. 1 = full) whose faithful render
+    // fits the target. Bigger target -> higher resolution -> sharper.
+    var lo = 0, hi = 1, best = 0, bestEst = await estimateForced(0, samples, corr);
     if(bestEst <= target){
-      for(var it = 0; it < 6; it++){ var mid = (lo + hi) / 2; var est = await estimateTotal(mid, samples, corr); if(est <= target){ best = mid; bestEst = est; lo = mid; } else hi = mid; }
+      for(var it = 0; it < 7; it++){ var mid = (lo + hi) / 2; setProgress(10 + it * 2, "Finding the sharpest pages that fit your size..."); var est = await estimateForced(mid, samples, corr); if(est <= target){ best = mid; bestEst = est; lo = mid; } else hi = mid; }
     }
     var res = await compressPass(target, { level: best, force: true });
     res.forced = true; res.passes = attempt + 1;
     var actual = res.blob.size;
-    if(actual <= target || attempt === 1 || best <= 1e-6 || !(bestEst > 0)){ res.belowReadable = false; return res; }
+    if(actual <= target || attempt === 1 || best >= 1 - 1e-6 || !(bestEst > 0)){ res.belowReadable = false; return res; }
     corr *= actual / bestEst;   // overshot: recalibrate and try once more
   }
 }
@@ -1240,22 +1249,16 @@ async function compressToTarget(target){
   await documentTopPx(samplePageList(), { nativeOnly: true });
   var native = !(state.nativeLong > 0);
   if(native){
-    // A native PDF (real text / vector graphics). It is NEVER rasterised or
-    // re-rendered automatically - that would change the pages. Only lossless
-    // compression is applied by default.
-    var L0 = null;
-    if(target >= state.originalSize * 0.5){   // lossless could plausibly reach the target
-      L0 = await losslessOptimise();
+    // A native PDF (real text / vector graphics). Lossless re-pack first - it
+    // keeps the text selectable - but only when it could plausibly reach the
+    // target (it rarely beats ~15% on an already-packed file). Otherwise the
+    // document is compressed by FAITHFUL RENDERING through the normal ladder
+    // below: each page is rasterised exactly as it looks, at the resolution
+    // that fits the target. Nothing is re-flowed or re-typed.
+    if(target >= state.originalSize * 0.85){
+      var L0 = await losslessOptimise();
       if(L0 && L0.bytes.length <= target){ setProgress(100, "Done!"); return losslessResult(target, L0); }
     }
-    // Can't reach the target without changing the document. Deliver it
-    // UNCHANGED (the lossless re-pack if it helped, else the original file).
-    var small = (L0 && L0.bytes.length < state.originalSize) ? L0 : null;
-    var bytes0 = small ? small.bytes : new Uint8Array(await state.file.arrayBuffer());
-    setProgress(8, "Checking whether the text could be rebuilt smaller...");
-    var tx = await hasExtractableText();
-    setProgress(100, "Done!");
-    return { blob: new Blob([bytes0], { type: "application/pdf" }), native: true, nativeFloor: true, lossless: small, target: target, canRebuild: (tx.avg >= 8 && tx.textFraction >= 0.6), level: 1, reachable: bytes0.length <= target, belowReadable: false, passes: 1 };
   }
   for(var attempt = 0; attempt < 3; attempt++){
     passPrefix = attempt ? "Pass " + (attempt + 1) + " - using your full size budget. " : "";
@@ -1618,7 +1621,7 @@ function showResult(blob, meta){
       reduction: pct + "% smaller"
     };
   } else if(meta.forced){
-    var dpi = Math.round(((meta.settings && meta.settings.longPx) || LONG_MIN) / 11.7);
+    var dpi = Math.round(((meta.settings && meta.settings.longPx) || LONG_MIN) / 8.27);
     opts = {
       title: compSize <= target ? "Compressed to " + fmtSize(target) + " — " + fmtSize(compSize) : "Smallest one-file version — " + fmtSize(compSize),
       note: (compSize <= target ? "Done — now " + fmtSize(compSize) + " (" + pct + "% smaller), at your " + fmtSize(target) + " target. " : "This is as small as it goes in one file: " + fmtSize(compSize) + " (" + pct + "% smaller). ")
