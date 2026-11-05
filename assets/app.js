@@ -10,7 +10,7 @@ var ASSET_DIR = (function(){
 var pdfjsLib = window.pdfjsLib;
 pdfjsLib.GlobalWorkerOptions.workerSrc = ASSET_DIR + "vendor/pdf.worker.min.js";
 var PDFLib = window.PDFLib;
-var BUILD = "v46"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
+var BUILD = "v47"; // shown in the footer; keep in step with the ?v= cache-buster in index.html
 
 var state = {
   file: null,
@@ -439,6 +439,22 @@ function runForceToTarget(target){
     setBusy(false);
     console.error("HyperCompress force-to-target failed:", err);
     toast("Could not fit the target: " + ((err && (err.message || err.name)) || String(err)), "err");
+    setProgress(0, "Failed");
+  });
+}
+function runRebuild(target){
+  setBusy(true);
+  $("#progressWrap").classList.remove("hidden");
+  $("#resultArea").classList.add("hidden");
+  setProgress(0, "Rebuilding from the document's text...");
+  rebuildFromText().then(function(res){
+    setBusy(false);
+    res.target = target; res.reachable = res.blob.size <= target; res.userChose = true;
+    showResult(res.blob, res);
+  }).catch(function(err){
+    setBusy(false);
+    console.error("HyperCompress rebuild failed:", err);
+    toast("Could not rebuild: " + ((err && (err.message || err.name)) || String(err)), "err");
     setProgress(0, "Failed");
   });
 }
@@ -1224,25 +1240,22 @@ async function compressToTarget(target){
   await documentTopPx(samplePageList(), { nativeOnly: true });
   var native = !(state.nativeLong > 0);
   if(native){
-    setProgress(6, "Checking the document's text...");
-    var tx = await hasExtractableText();
-    var textDoc = tx.avg >= 8 && tx.textFraction >= 0.6;
-    // The lossless re-pack rarely beats ~30% and is slow on a big object tree,
-    // so only run it when the target is within reach of it (not far below the
-    // original). Far below -> a text doc rebuilds from its text; otherwise the
-    // raster ladder handles it.
+    // A native PDF (real text / vector graphics). It is NEVER rasterised or
+    // re-rendered automatically - that would change the pages. Only lossless
+    // compression is applied by default.
     var L0 = null;
-    if(!textDoc || target >= state.originalSize * 0.6){
+    if(target >= state.originalSize * 0.5){   // lossless could plausibly reach the target
       L0 = await losslessOptimise();
       if(L0 && L0.bytes.length <= target){ setProgress(100, "Done!"); return losslessResult(target, L0); }
     }
-    if(textDoc && !(L0 && target >= L0.bytes.length)){
-      var R = await rebuildFromText();
-      R.target = target; R.reachable = R.blob.size <= target;
-      R.losslessSize = L0 ? L0.bytes.length : 0;
-      setProgress(100, "Done!");
-      return R;
-    }
+    // Can't reach the target without changing the document. Deliver it
+    // UNCHANGED (the lossless re-pack if it helped, else the original file).
+    var small = (L0 && L0.bytes.length < state.originalSize) ? L0 : null;
+    var bytes0 = small ? small.bytes : new Uint8Array(await state.file.arrayBuffer());
+    setProgress(8, "Checking whether the text could be rebuilt smaller...");
+    var tx = await hasExtractableText();
+    setProgress(100, "Done!");
+    return { blob: new Blob([bytes0], { type: "application/pdf" }), native: true, nativeFloor: true, lossless: small, target: target, canRebuild: (tx.avg >= 8 && tx.textFraction >= 0.6), level: 1, reachable: bytes0.length <= target, belowReadable: false, passes: 1 };
   }
   for(var attempt = 0; attempt < 3; attempt++){
     passPrefix = attempt ? "Pass " + (attempt + 1) + " - using your full size budget. " : "";
@@ -1552,7 +1565,7 @@ function showResult(blob, meta){
   var opts;
   var ni = state.nativeInfo;
   var diag = "Build " + BUILD + " · " + state.pageCount + " pages · scan image " + (ni ? ni.w + "×" + ni.h + " px (" + ni.kind + ")" : "not found") + " · native " + (state.nativeLong || 0) + " px · top " + topPx() + " px"
-    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG q" + (meta.tableQ || 0).toFixed(2) + " @ " + meta.tablePx + " px" + (meta.figSkipped ? " (" + meta.figSkipped + " more as 1-bit)" : "") : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "") + (state.figPagesCount != null ? " · table pages " + state.figPagesCount + "/" + state.pageCount : "") + (photoScan() ? " · sharpened before threshold" : "") + (meta.fragTotal ? " · fine-print pages kept as scanned " + (meta.kept || 0) + "/" + meta.fragTotal : "") + (lowDpiPhotoScan() ? " · low-dpi scan: grayscale rung off" : "") + (meta.native ? " · native PDF (no page image)" : "") + (meta.lossless ? " · lossless re-pack: " + meta.lossless.dup + " duplicate stream(s) of " + meta.lossless.streams + " removed, " + (meta.lossless.flated || 0) + " uncompressed stream(s) deflated" + (meta.losslessAlt ? " -> " + fmtSize(meta.losslessAlt) : "") : "") + (meta.native && state.losslessErr ? " · lossless re-pack FAILED: " + state.losslessErr : "") + (meta.native && state.lossless && !meta.lossless ? " · lossless re-pack: " + state.lossless.dup + " dup / " + (state.lossless.flated || 0) + " deflated -> " + fmtSize(state.lossless.bytes.length) + " (larger than this)" : "") + (meta.forced ? " · FORCED below readable to fit target" : "") + (meta.rebuilt ? " · rebuilt from text: " + meta.items + " text items" + (meta.imagePages ? " + " + meta.imagePages + " image page(s)" : "") : "");
+    + (meta.tone ? " · stored at " + meta.toneLongPx + " px" : (meta.settings ? " · stored at " + meta.settings.longPx + " px" : "")) + (typeof meta.level === "number" ? " · level " + meta.level.toFixed(2) : "") + (meta.passes ? " · passes " + meta.passes : "") + (meta.textMode ? " · text mode" : "") + (meta.tone ? " · tone JPEG q" + meta.toneQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.toneLongPx + " px" : "") + (meta.mrc ? (meta.bgOn ? " · background JPEG q" + meta.bgQ.toFixed(2) + (meta.toneColor ? " colour" : " gray") + " @ " + meta.bgPx + " px" : " · no background layer") + (meta.figTonePages ? " · " + meta.figTonePages + " numbers page(s) as grayscale JPEG q" + (meta.tableQ || 0).toFixed(2) + " @ " + meta.tablePx + " px" + (meta.figSkipped ? " (" + meta.figSkipped + " more as 1-bit)" : "") : "") : "") + ((meta.allocUp || meta.allocDown) ? " · figures pages up " + meta.allocUp + ", prose pages down " + meta.allocDown : "") + (state.figPagesCount != null ? " · table pages " + state.figPagesCount + "/" + state.pageCount : "") + (photoScan() ? " · sharpened before threshold" : "") + (meta.fragTotal ? " · fine-print pages kept as scanned " + (meta.kept || 0) + "/" + meta.fragTotal : "") + (lowDpiPhotoScan() ? " · low-dpi scan: grayscale rung off" : "") + (meta.native ? " · native PDF (no page image)" : "") + (meta.lossless ? " · lossless re-pack: " + meta.lossless.dup + " duplicate stream(s) of " + meta.lossless.streams + " removed, " + (meta.lossless.flated || 0) + " uncompressed stream(s) deflated" + (meta.losslessAlt ? " -> " + fmtSize(meta.losslessAlt) : "") : "") + (meta.native && state.losslessErr ? " · lossless re-pack FAILED: " + state.losslessErr : "") + (meta.native && state.lossless && !meta.lossless ? " · lossless re-pack: " + state.lossless.dup + " dup / " + (state.lossless.flated || 0) + " deflated -> " + fmtSize(state.lossless.bytes.length) + " (larger than this)" : "") + (meta.forced ? " · FORCED below readable to fit target" : "") + (meta.rebuilt ? " · rebuilt from text: " + meta.items + " text items" + (meta.imagePages ? " + " + meta.imagePages + " image page(s)" : "") : "") + (meta.nativeFloor ? " · native PDF kept unchanged (already optimal)" : "");
 
   if(compSize >= origSize){
     // Rasterising this PDF can't beat it even at the most aggressive setting —
@@ -1583,7 +1596,17 @@ function showResult(blob, meta){
   }
   var softNote = " The resolution was lowered to reach this size, so the text is softer — raise the target a little if you want it crisper.";
 
-  if(meta.rebuilt){
+  if(meta.nativeFloor){
+    opts = {
+      title: "Already as small as it goes unchanged — " + fmtSize(compSize),
+      note: "This is a native PDF — real text and vector graphics, already compressed. It cannot be made smaller without CHANGING the pages (removing or re-rendering what is on them). Kept exactly as it is, every page untouched, the smallest it goes is " + fmtSize(compSize)
+        + (compSize < origSize ? " (" + pct + "% smaller)" : " — the same as your file, because it was already packed")
+        + ". Your " + fmtSize(meta.target || compSize) + " target is below that."
+        + (meta.canRebuild ? " If you are willing to change the look to hit the size, “Make it smaller” below re-renders the text in a standard font (crisp and selectable, but the original fonts and table lines are simplified). Otherwise this file keeps the document exactly as-is." : " To get a smaller file you would need to split it into parts, each keeping the pages unchanged."),
+      reduction: compSize < origSize ? pct + "% smaller" : "unchanged",
+      rebuildTarget: meta.canRebuild ? (meta.target || 0) : 0
+    };
+  } else if(meta.rebuilt){
     var under = compSize <= (meta.target || 0);
     opts = {
       title: "Rebuilt from text — " + fmtSize(compSize),
@@ -1708,6 +1731,13 @@ function finishResult(blob, outSize, opts){
   dg.textContent = opts.diag || ""; dg.classList.toggle("hidden", !opts.diag);
 
   // the opt-in text-recognition button (only when the readable floor missed the target)
+  var rb = $("#rebuildBtn"); if(rb) rb.remove();
+  if(opts.rebuildTarget){
+    rb = document.createElement("button"); rb.id = "rebuildBtn"; rb.className = "btn btn-ghost btn-lg"; rb.title = "Re-renders the text in a standard font to reach your size - changes the appearance (fonts, table lines)";
+    rb.textContent = "📄 Make it smaller (changes the look)";
+    rb.addEventListener("click", function(){ runRebuild(opts.rebuildTarget); });
+    $("#downloadBtn").parentNode.insertBefore(rb, $("#startOverBtn"));
+  }
   var fb = $("#forceBtn"); if(fb) fb.remove();
   if(opts.forceTarget){
     fb = document.createElement("button"); fb.id = "forceBtn"; fb.className = "btn btn-ghost btn-lg"; fb.title = "Rasterises the pages smaller to hit your size - text becomes soft; zoom in to read";
